@@ -1,0 +1,30 @@
+# OpenPong dashboard (apps/web) — Next.js 16 UI + BFF. The BFF holds the bearer
+# and proxies to the agent server, so this is a Node server, not a static
+# export. Build from the repository root:
+#
+#   docker build -f Dockerfile.frontend -t openpong-web .
+#
+# It listens on $PORT (default 3000). Set OPENPONG_SERVER_URL and
+# OPENPONG_COOKIE_SECRET at runtime.
+FROM node:22-bookworm-slim AS build
+ENV PNPM_HOME=/pnpm PATH=/pnpm:$PATH
+RUN corepack enable
+WORKDIR /app
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY patches ./patches
+COPY apps ./apps
+COPY packages ./packages
+COPY tsconfig.json tsconfig.build.json ./
+RUN pnpm install --frozen-lockfile
+RUN pnpm --dir apps/web build
+
+FROM node:22-bookworm-slim
+ENV NODE_ENV=production
+ENV PNPM_HOME=/pnpm PATH=/pnpm:$PATH
+RUN corepack enable
+WORKDIR /app
+# next start needs the built .next output plus the workspace node_modules.
+COPY --from=build /app ./
+EXPOSE 3000
+# `next start` reads $PORT; default to 3000 when unset.
+CMD ["sh", "-c", "pnpm --dir apps/web exec next start -p ${PORT:-3000}"]

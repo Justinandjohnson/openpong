@@ -1,0 +1,19 @@
+# Vendored OmniPong service — local/runtime artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Never commit a local database or secrets
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+.env
+.credentials.json
+
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+playwright_data/
+backend/debug/

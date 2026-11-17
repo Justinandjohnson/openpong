@@ -37,6 +37,7 @@ import { ChatScreen, WorkspaceTools } from "./src/chat";
 import { ComputerEntry } from "./src/computer";
 import { ComputerDraftProvider } from "./src/computer-drafts";
 import { Details } from "./src/details";
+import { ProfileGate, ProfileProvider } from "./src/profile";
 import { BrowserScreen, CalendarScreen, FilesScreen, MailScreen } from "./src/screens";
 import { ThreadsProvider, ThreadsSheet, useMuseThread } from "./src/threads";
 import { Button, Card, colors, ErrorNotice, Field, IconButton, Mascot, s } from "./src/ui";
@@ -58,7 +59,7 @@ const titles: Partial<Record<Section, { title: string; subtitle: string }>> = {
   },
   apps: {
     title: "Apps",
-    subtitle: "Connections, capabilities and what your agent remembers.",
+    subtitle: "Your profile and area, connections, capabilities and what your agent remembers.",
   },
   connections: { title: "Apps", subtitle: "Connections and capabilities." },
   mail: { title: "Mail", subtitle: "The conversations behind your work." },
@@ -111,7 +112,7 @@ export default function App() {
             <Text
               style={{ fontSize: 32, color: colors.text, letterSpacing: -1, fontWeight: "500" }}
             >
-              Welcome to OpenMuse.
+              Welcome to OpenPong.
             </Text>
             <Text style={[s.muted, { textAlign: "center" }]}>A little room for your day.</Text>
             {busy ? (
@@ -130,7 +131,7 @@ export default function App() {
                   Open workspace
                 </Button>
                 <Text style={[s.small, { marginTop: 15 }]}>
-                  Local workspaces open without a key. Make sure your OpenMuse server is running at{" "}
+                  Local workspaces open without a key. Make sure your OpenPong server is running at{" "}
                   {API_URL}.
                 </Text>
               </Card>
@@ -211,19 +212,23 @@ function WorkspaceApp({ token }: { token: string }) {
     <WorkspaceContext.Provider
       value={{ workspace, api, section, navigate, refresh, open, close, notify: setToast, ask }}
     >
-      <AgentWorkspaceProvider>
-        <ComputerDraftProvider key={token}>
-          <ThreadsProvider>
-            <WorkspaceShell
-              detail={detail}
-              toast={toast}
-              clearToast={() => setToast("")}
-              error={error}
-              prompt={prompt}
-            />
-          </ThreadsProvider>
-        </ComputerDraftProvider>
-      </AgentWorkspaceProvider>
+      <ProfileProvider>
+        <AgentWorkspaceProvider>
+          <ComputerDraftProvider key={token}>
+            <ThreadsProvider>
+              <ProfileGate>
+                <WorkspaceShell
+                  detail={detail}
+                  toast={toast}
+                  clearToast={() => setToast("")}
+                  error={error}
+                  prompt={prompt}
+                />
+              </ProfileGate>
+            </ThreadsProvider>
+          </ComputerDraftProvider>
+        </AgentWorkspaceProvider>
+      </ProfileProvider>
     </WorkspaceContext.Provider>
   );
 }
@@ -261,7 +266,7 @@ function WorkspaceShell({
     data?.tasks.find(
       (task) => task.status === "waiting_approval" || task.status === "waiting_input",
     ) || data?.tasks.find((task) => task.status === "running");
-  const agentName = data?.identity.name || "OpenMuse";
+  const agentName = data?.identity.name || "OpenPong";
   const status = activeTask
     ? activeTask.status === "waiting_approval"
       ? `Ready to review · ${activeTask.title}`

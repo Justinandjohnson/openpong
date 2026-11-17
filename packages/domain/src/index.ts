@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { tournamentSignupSchema } from "./agent.ts";
 
 export type WorkspaceMode = "sample" | "live";
 export type Section =
@@ -140,6 +141,7 @@ export const proposalSchema = z.discriminatedUnion("kind", [
     kind: z.literal("calendar.delete"),
     data: z.object({ calendarId: z.string(), eventId: z.string().min(1), title: z.string() }),
   }),
+  z.object({ kind: z.literal("omnipong.signup"), data: tournamentSignupSchema }),
 ]);
 export type EmailDraft = z.infer<typeof emailDraftSchema>;
 export type EventDraft = z.infer<typeof eventDraftSchema>;
@@ -209,4 +211,7 @@ export interface ExecutionBackend {
   health(): Promise<{ available: boolean; detail: string }>;
 }
 
+// Per-owner identity and area, entered at onboarding and edited in Settings.
+export type { OwnerProfile, OwnerProfileInput } from "./agent.ts";
+export { isProfileOnboarded, ownerProfileSchema } from "./agent.ts";
 export type { ComputerCommand, ComputerDirectory, ComputerSnapshot } from "./computer.ts";

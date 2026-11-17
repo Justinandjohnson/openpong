@@ -67,6 +67,17 @@ after(async () => {
   if (directory) await rm(directory, { recursive: true, force: true });
 });
 
+test("action proposals are listable for the owner and closed to strangers", async () => {
+  assert.equal((await server.app.request("/api/agent/actions")).status, 401);
+  const proposals = await read<{ id: string; status: string }[]>("/actions");
+  assert.ok(Array.isArray(proposals));
+  assert.ok(
+    proposals.every(
+      (proposal) => typeof proposal.id === "string" && typeof proposal.status === "string",
+    ),
+  );
+});
+
 test("agent API requires a session and reports the actual worker state", async () => {
   assert.equal((await server.app.request("/api/agent")).status, 401);
   assert.equal(
@@ -81,7 +92,7 @@ test("agent API requires a session and reports the actual worker state", async (
   );
   const workspace = await read<AgentWorkspace>("");
   assert.equal(workspace.worker.running, false);
-  assert.equal(workspace.identity.name, "OpenMuse");
+  assert.equal(workspace.identity.name, "OpenPong");
   assert.equal(workspace.identity.tone, "warm");
 });
 
@@ -106,6 +117,69 @@ test("the main Rich Thread survives reopening and concurrent initialization", as
   assert.equal(reopened.threadId, threads[0].threadId);
   assert.equal(reopened.existing, true);
   assert.equal(await db.get("other-user", "conversation-settings", "main"), null);
+});
+
+test("the app boots and serves chat without an Intelligence key", async () => {
+  const plain = await createApp(db, {
+    ...config,
+    agentBackend: "sample",
+    intelligenceApiKey: undefined,
+  });
+  try {
+    const health = await plain.app.request("/api/health");
+    assert.equal(health.status, 200);
+    assert.deepEqual(await health.json(), {
+      ok: true,
+      mode: "sample",
+      agentConfigured: true,
+      browserConfigured: false,
+      threadsConfigured: false,
+    });
+    const session = await plain.app.request("/api/session", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    assert.equal(session.status, 200);
+    const plainToken = (await session.json()).token;
+    const thread = await plain.app.request("/api/main-thread", {
+      headers: { Authorization: `Bearer ${plainToken}` },
+    });
+    assert.equal(thread.status, 503);
+    assert.match(
+      (await thread.json()).error,
+      /Rich Threads are not configured\. Set CPK_INTELLIGENCE_API_KEY/,
+    );
+    const snapshot = await plain.app.request("/api/workspace", {
+      headers: { Authorization: `Bearer ${plainToken}` },
+    });
+    assert.equal((await snapshot.json()).runtime.richThreads, false);
+    const info = await plain.app.request("/api/copilotkit/info", {
+      headers: { Authorization: `Bearer ${plainToken}` },
+    });
+    assert.equal(info.status, 200, await info.clone().text());
+    assert.equal((await info.json()).mode, "sse");
+    // Native AG-UI chat still streams end to end; only thread persistence degrades.
+    const run = await plain.app.request("/api/copilotkit/agent/default/run", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${plainToken}`, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        threadId: "no-key-thread",
+        runId: "no-key-run",
+        messages: [{ id: "no-key-message", role: "user", content: "Show my calendar" }],
+        tools: [],
+        context: [],
+        state: {},
+      }),
+    });
+    assert.equal(run.status, 200, await run.clone().text());
+    const stream = await run.text();
+    assert.match(stream, /RUN_STARTED/);
+    assert.match(stream, /TEXT_MESSAGE_CONTENT/);
+    assert.match(stream, /RUN_FINISHED/);
+  } finally {
+    await plain.agent.stop();
+  }
 });
 
 test("task detail and controls stay scoped to the authenticated owner", async () => {

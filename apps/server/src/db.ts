@@ -130,6 +130,18 @@ export class Store {
     );
     return (result.rows[0]?.data as T | undefined) ?? null;
   }
+  /**
+   * Insert a value under an explicit key when the key is not the value's `id`
+   * (accounts are keyed by email but owned by a generated id). Returns null when
+   * the key already exists, so a duplicate signup can never overwrite an account.
+   */
+  async insertIfAbsentAt<T>(owner: string, kind: string, id: string, value: T): Promise<T | null> {
+    const result = await this.db.query(
+      "INSERT INTO records(owner,kind,id,data) VALUES($1,$2,$3,$4::jsonb) ON CONFLICT DO NOTHING RETURNING data",
+      [owner, kind, id, JSON.stringify(value)],
+    );
+    return (result.rows[0]?.data as T | undefined) ?? null;
+  }
   async scan<T>(kind: string): Promise<{ owner: string; value: T }[]> {
     const result = await this.db.query(
       "SELECT jsonb_build_object('owner',owner,'value',data) AS data FROM records WHERE kind=$1 ORDER BY updated_at ASC",

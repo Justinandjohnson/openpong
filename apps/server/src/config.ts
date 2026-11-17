@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { parseEnv } from "node:util";
+import { defaultOmniPongServiceUrl } from "./omnipong/service.ts";
 
 /** .env keys whose file value loses to a different value already set in the environment. */
 export function shadowedEnvKeys(
@@ -22,6 +23,14 @@ if (existsSync(".env")) {
           ? "Unset it to use the .env value."
           : "Unset them to use the .env values."),
     );
+}
+// OpenPong: OpenRouter is OpenAI-compatible. If an OpenRouter key is present and no explicit
+// OpenAI key/base URL is configured, route the OpenAI adapter through OpenRouter. OpenRouter
+// implements the Chat Completions wire format (not the Responses API), so opt into it.
+if (process.env.OPENROUTER_API_KEY) {
+  process.env.OPENAI_API_KEY ??= process.env.OPENROUTER_API_KEY;
+  process.env.OPENAI_BASE_URL ??= "https://openrouter.ai/api/v1";
+  process.env.OPENAI_CHAT_COMPLETIONS ??= "true";
 }
 // Capture the full setup/activation funnel while preserving explicit SDK opt-outs
 // and any deployment-specific sampling rate. Config loads before runtime imports.
@@ -49,8 +58,22 @@ export interface Config {
   googleRedirectUri: string;
   workerUrl?: string;
   workerToken?: string;
+  omnipongServiceUrl?: string;
+  omnipongServiceToken?: string;
+  /** The OpenPong relay base URL (services/omnipong/relay). Optional. */
+  relayUrl?: string;
+  /** Operator token the relay's control plane requires (RELAY_OPERATOR_TOKEN). */
+  relayToken?: string;
+  /**
+   * Safety gate for real tournament registration. Off unless
+   * `OMNIPONG_ALLOW_REAL_SIGNUP === "true"`; even then, a real registration
+   * still requires a human approval in the native app.
+   */
+  omnipongAllowRealSignup?: boolean;
   taskWorkerEnabled?: boolean;
   webSearchEnabled?: boolean;
+  /** Outbound SMS alerts (scout). Off only when OMNIPONG_SMS_ALERTS=false. */
+  smsAlertsEnabled?: boolean;
   computerEnabled?: boolean;
   computerImage?: string;
   computerDeploymentId?: string;
@@ -66,25 +89,32 @@ export type ComputerProvider = "docker" | "e2b-desktop";
 /** Pinned so live rankings do not shift when TypeSafe moves the `jev-latest` alias. */
 export const defaultJevModel = "jev-1.13.0";
 
-export const intelligenceKeyRequiredMessage =
-  "OpenMuse requires CPK_INTELLIGENCE_API_KEY. " +
-  "Run `npx copilotkit@latest login` and `npx copilotkit@latest project select`, " +
-  "then set the generated server-only key. " +
+/**
+ * Boot warning shown when Rich Threads are unavailable. The key is optional:
+ * it only adds cross-device thread history, so chat keeps working without it.
+ */
+export const intelligenceKeyOptionalMessage =
+  "[OpenPong] Threads disabled; set CPK_INTELLIGENCE_API_KEY to sync conversations across devices. " +
+  "Chat and tools still work without it. Run `npx copilotkit@latest login` and " +
+  "`npx copilotkit@latest project select`, then set the generated server-only key. " +
   "See https://docs.copilotkit.ai/intelligence/connect-your-runtime";
+
+/** Actionable response when a client asks for Rich Threads without a key. */
+export const intelligenceThreadsDisabledMessage =
+  "Rich Threads are not configured. Set CPK_INTELLIGENCE_API_KEY, " +
+  "or keep using chat without cross-device history.";
+
+/**
+ * Rich Threads are opt-in. Only a non-blank Intelligence key enables the
+ * CopilotKit Intelligence runtime; without it the API runs native AG-UI.
+ */
+export function intelligenceConfigured(config: Pick<Config, "intelligenceApiKey">): boolean {
+  return Boolean(config.intelligenceApiKey?.trim());
+}
 
 export function required(name: string, message: string, value = process.env[name]): string {
   if (!value?.trim()) throw new Error(message);
   return value.trim();
-}
-
-export function assertApiDeploymentConfig(
-  config: Config,
-): asserts config is Config & { intelligenceApiKey: string } {
-  required(
-    "CPK_INTELLIGENCE_API_KEY",
-    intelligenceKeyRequiredMessage,
-    config.intelligenceApiKey ?? "",
-  );
 }
 
 /** Accept a full worker URL, or host:port from a platform that omits the scheme. */
@@ -102,6 +132,7 @@ export function browserWorkerUrl(value?: string): string | undefined {
 // writes never re-fire here: they are dispatched outside the model loop through
 // reviewed, idempotency-keyed actions.
 export const MODEL_MAX_RETRIES = 2;
+let warnedIntelligenceDisabled = false;
 export function readConfig(): Config {
   const mode = process.env.WORKSPACE_MODE ?? "sample";
   if (mode !== "sample" && mode !== "live")
@@ -149,14 +180,26 @@ export function readConfig(): Config {
     agentBackend: backend,
     agentUrl: process.env.AGENT_URL,
     agentToken: process.env.AGENT_TOKEN,
-    intelligenceApiKey: required("CPK_INTELLIGENCE_API_KEY", intelligenceKeyRequiredMessage),
+    intelligenceApiKey: process.env.CPK_INTELLIGENCE_API_KEY?.trim() || undefined,
     googleClientId: process.env.GOOGLE_CLIENT_ID,
     googleClientSecret: process.env.GOOGLE_CLIENT_SECRET,
     googleRedirectUri: `${publicUrl}/api/google/callback`,
     workerUrl: browserWorkerUrl(process.env.BROWSER_WORKER_URL),
     workerToken: process.env.WORKER_TOKEN,
+    // The vendored OmniPong service is optional: with neither set the server still
+    // boots and degrades to a clean tool error when a table-tennis tool is called.
+    omnipongServiceUrl: process.env.OMNIPONG_SERVICE_URL?.trim() || defaultOmniPongServiceUrl,
+    omnipongServiceToken: process.env.OMNIPONG_SERVICE_TOKEN?.trim() || undefined,
+    // The relay carries browser control for the owner's own computer (no stored
+    // credentials). Optional: without a URL the dashboard shows setup guidance.
+    relayUrl: process.env.RELAY_URL?.trim() || undefined,
+    relayToken:
+      process.env.RELAY_TOKEN?.trim() || process.env.RELAY_OPERATOR_TOKEN?.trim() || undefined,
+    // Real signup stays off unless explicitly enabled; approval is still required.
+    omnipongAllowRealSignup: process.env.OMNIPONG_ALLOW_REAL_SIGNUP === "true",
     taskWorkerEnabled: process.env.TASK_WORKER_ENABLED !== "false",
     webSearchEnabled: process.env.WEB_SEARCH_ENABLED !== "false",
+    smsAlertsEnabled: process.env.OMNIPONG_SMS_ALERTS !== "false",
     computerEnabled: process.env.COMPUTER_ENABLED === "true",
     computerImage: process.env.COMPUTER_IMAGE ?? "openmuse-computer:local",
     // A blank line from .env is unset; otherwise every such install would share one name.
@@ -180,5 +223,11 @@ export function readConfig(): Config {
     );
   if (mode === "sample" && !["127.0.0.1", "localhost", "::1"].includes(config.host))
     throw new Error("Sample workspace is local-only. HOST must be a loopback address.");
+  // Optional keys degrade only Rich Threads; surfacing the hint once at boot keeps
+  // self-hosted logs actionable without failing startup or spamming test runs.
+  if (!config.intelligenceApiKey && !warnedIntelligenceDisabled) {
+    warnedIntelligenceDisabled = true;
+    console.warn(intelligenceKeyOptionalMessage);
+  }
   return config;
 }

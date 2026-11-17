@@ -1,0 +1,3310 @@
+import asyncio
+import json
+import logging
+import os
+import subprocess
+import sys
+from datetime import datetime
+from typing import Literal
+from xml.sax.saxutils import escape
+
+import anthropic
+import httpx
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel
+from sqlalchemy import DateTime, bindparam, create_engine, text
+from sqlalchemy.orm import sessionmaker
+
+# Load .env variables
+# NOTE (vendored): the OmniPong app originally lived at <repo>/rubberr/backend,
+# so the service root was two levels up. In this vendored layout the FastAPI
+# app is at services/omnipong/backend, so the service root is one level up.
+log = logging.getLogger("omnipong")
+
+load_dotenv(os.path.join(os.path.dirname(__file__), "../.env"))
+
+# Configurable player identity so anyone can run this — defaults are generic.
+PLAYER_NAME = os.getenv("PLAYER_NAME", "the player")
+PLAYER_FULL_NAME = os.getenv("PLAYER_FULL_NAME", PLAYER_NAME)
+
+# Add project root to path so we can import browser_manager
+# NOTE (vendored): service root is one level up (see dotenv note above).
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from browser_manager import BrowserManager
+from models import Base
+
+# Import shared utilities
+from .tournament_intelligence import get_tournament_intelligence
+from .twilio_sms import (
+    HELP_TEXT,
+    command_from_body,
+    form_to_params,
+    format_matches,
+    format_tournaments,
+    public_url_for,
+    verify_signature,
+)
+
+
+# Initialize models
+class ChatMessage(BaseModel):
+    message: str
+
+
+class PlayerSearch(BaseModel):
+    name: str = None
+
+
+class ProcessText(BaseModel):
+    text: str
+
+
+class LeagueSyncRequest(BaseModel):
+    """Body for POST /tools/sync/league (all fields optional)."""
+
+    league_urls: list[str] | None = None
+    owner: str | None = None
+    legacy: bool = False
+    all_matches: bool = False
+    segments: bool = True
+
+
+class StadiumSyncStartRequest(BaseModel):
+    """Request body for the Tier-3 sync-start endpoints (/tools/sync/stadium,
+    /tools/sync/omnipong). Matches the frontend contract documented in
+    StadiumSyncPanel.tsx: { player_name }. There is no session_token here —
+    F provisions the relay session itself (see _provision_relay_session);
+    the frontend/companion never hands F a raw CDP session token directly."""
+
+    player_name: str | None = None
+    model: str | None = None
+
+
+# --- Tier-3/Tier-1 browser-agent bridge ---
+# Frozen interface: docs/RELAY_ARCHITECTURE.md §8 (B<->F). F calls
+# run_browser_task(...); F does not build cdp_url or talk CDP directly — that's
+# Agent B's module. Import is guarded because browser_agent.py may not exist yet
+# while B is still building it; callers get a clean 503, not a silent fallback.
+try:
+    from .browser_agent import run_browser_task, validate_player_name, validate_task_text
+
+    BROWSER_AGENT_AVAILABLE = True
+    _browser_agent_import_error = None
+except ImportError as e:
+    BROWSER_AGENT_AVAILABLE = False
+    _browser_agent_import_error = str(e)
+    run_browser_task = None
+    validate_player_name = None
+    validate_task_text = None
+
+
+def _get_user_openrouter_key(request: Request) -> str | None:
+    """BYOK OpenRouter key for browser-agent calls.
+
+    OQ-4 (RELAY_ARCHITECTURE.md §6 / BROWSER_USE_SPIKE.md): reuses the same
+    `X-User-Api-Key` header the frontend already sends for the Anthropic key
+    (DemoBar.tsx's single BYOK field accepts either an Anthropic `sk-ant-...`
+    or OpenRouter `sk-or-...` key today, and StadiumSyncPanel.tsx already
+    forwards it via getAIHeaders()). The spike's recommendation to split this
+    into a distinct `X-User-OpenRouter-Key` header was explicitly "not
+    implemented, a recommendation for E/F to adopt" — since E's frontend
+    ships one BYOK field and both E and F already agree on this single
+    header, there is no actual Phase-1 drift here to reconcile, so Phase 2
+    leaves it as-is rather than force a frontend change for no behavior gain.
+    """
+    header_key = request.headers.get("X-User-Api-Key") or None
+    if header_key:
+        return header_key
+    # Server-side fallback: the app's own key from .env, so owner-only flows
+    # (e.g. USATT sync) work without requiring a BYOK header per request.
+    for env_name in ("OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+        value = os.getenv(env_name)
+        if value:
+            return value
+    return None
+
+
+def _browser_task_error(result) -> JSONResponse:
+    """Map a non-ok BrowserTaskResult to the frozen §7 error shape:
+    {"error": {"type": ..., "detail": ...}}. No fallback — if browser_agent's
+    result doesn't carry a compatible `.error` dict, that's a clean 500, not a
+    guessed shape."""
+    error = getattr(result, "error", None)
+    if not isinstance(error, dict) or "type" not in error or "detail" not in error:
+        raise HTTPException(
+            status_code=500,
+            detail="browser_agent returned a non-ok result without a valid {type, detail} error payload",
+        )
+    return JSONResponse(status_code=502, content={"error": error})
+
+
+def _relay_base_url() -> str:
+    """The relay's base URL, from either the new or the upstream env name."""
+    return (os.getenv("RELAY_URL") or os.getenv("RELAY_BASE_URL") or "").strip()
+
+
+def _relay_config():
+    """Build the relay config from the environment via the browser_backend seam."""
+    from browser_backend import relay_config
+
+    return relay_config()
+
+
+def _relay_operator_headers() -> dict:
+    """S3: the relay's own control endpoints (/session/start, /session/stop,
+    /session/gate, /pairing, /companions/*) are gated behind
+    RELAY_OPERATOR_TOKEN (relay/config.py's OPERATOR_TOKEN, checked by
+    relay/server.py's _require_operator_token). This backend is the relay's one
+    legitimate caller, so it must present the same token. If unset here, the
+    relay's own fail-closed check (503) is what surfaces the misconfiguration."""
+    token = os.getenv("RELAY_TOKEN") or os.getenv("RELAY_OPERATOR_TOKEN")
+    return {"X-Operator-Token": token} if token else {}
+
+
+async def _provision_relay_session() -> dict:
+    """Mint a fresh relay session via POST /session/start (§2.2), owner-scoped.
+
+    Delegates to browser_backend so the owner/pairing rules and the typed
+    "no companion connected" error live in one place. One relay round trip, no
+    retries: any rejection surfaces as a single clean HTTPException whose detail
+    is the typed message (e.g. "No companion connected — open OpenPong on your
+    computer and pair it").
+    """
+    from browser_backend import BrowserBackendError, provision_relay_session
+
+    try:
+        return await provision_relay_session(_relay_config())
+    except BrowserBackendError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+
+async def _stop_relay_session(session_token: str) -> None:
+    """E3: sessions were only ever reaped by IDLE_TTL_S (120s), blocking an
+    immediate re-sync with a 409 SessionConflict in the meantime. Call this
+    once run_browser_task has returned so the session ends right away.
+    Best-effort: the relay tears sessions down on its own regardless."""
+    from browser_backend import BrowserBackendError, stop_relay_session
+
+    try:
+        await stop_relay_session(_relay_config(), session_token)
+    except BrowserBackendError:
+        return
+
+
+async def _run_browser_agent_task(
+    *, task: str, site: str, player_name: str, session_token: str, model: str | None, request: Request
+):
+    """Shared call path into Agent B's run_browser_task for the synchronous
+    Tier-1 (public, no personal login) lookup flow."""
+    if not BROWSER_AGENT_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail=f"browser_agent module not available yet: {_browser_agent_import_error}",
+        )
+
+    # S2: same charset/length/control-char rules as browser_agent's own
+    # run_browser_task boundary, enforced again here at the request boundary.
+    name_error = validate_player_name(player_name)
+    if name_error:
+        raise HTTPException(status_code=400, detail=f"Invalid player_name: {name_error}")
+    task_error = validate_task_text(task)
+    if task_error:
+        raise HTTPException(status_code=400, detail=f"Invalid task: {task_error}")
+
+    openrouter_key = _get_user_openrouter_key(request)
+    if not openrouter_key:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing BYOK key (X-User-Api-Key header) — required as the OpenRouter key for the browser agent.",
+        )
+
+    relay_base_url = _relay_base_url()
+    if not relay_base_url:
+        raise HTTPException(
+            status_code=500, detail="RELAY_URL is not configured on the server."
+        )
+
+    primary = model or os.getenv("BROWSER_AGENT_MODEL", "openai/gpt-5.5")
+    fallback = os.getenv("BROWSER_AGENT_FALLBACK_MODEL", "deepseek/deepseek-v4.1-flash")
+    models = [primary]
+    if fallback and fallback != primary:
+        models.append(fallback)
+
+    def _should_retry(res) -> bool:
+        # A model that 404s/400s can still "finish" by declaring not_found, so
+        # retry when a USATT lookup comes back empty (no player) as well as on
+        # an outright LLM error. Non-LLM walls (gate timeout, companion gone)
+        # are not retried — another model would hit the same wall.
+        if res.status == "llm_error":
+            return True
+        if site == "usatt":
+            profile = res.matches[0] if res.matches else {}
+            if not isinstance(profile, dict):
+                return True
+            if profile.get("not_found") or not profile.get("player"):
+                return True
+        return False
+
+    result = None
+    for chosen in models:
+        result = await run_browser_task(
+            task=task,
+            site=site,
+            player_name=player_name,
+            session_token=session_token,
+            openrouter_key=openrouter_key,
+            model=chosen,
+            relay_base_url=relay_base_url,
+        )
+        if not _should_retry(result):
+            return result
+        print(f"[agent] model {chosen!r} gave no usable result ({result.error}) — falling back")
+    return result
+
+
+# --- Tier-3 gate-event SSE bridge (Phase 2 seam #1) ---
+#
+# There are two SSE layers in this platform: relay -> Agent B (B's
+# RelayGateClient, already wired against relay/server.py's
+# /session/events/{session_token}) and Agent F -> frontend
+# (StadiumSyncPanel.tsx's GET /tools/sync/stadium/events/{session_id}).
+# This module bridges them with one asyncio.Queue per in-flight sync,
+# keyed by session_id (we reuse the relay's session_token as that id — it is
+# not a credential, RELAY_ARCHITECTURE.md §5, and reusing it avoids a second
+# id-mapping table). run_browser_task's on_gate callback pushes
+# gate_open/gate_cleared/gate_timeout onto the queue; the SSE endpoint drains
+# it and formats each item as a named SSE event, ending on "done" or
+# "gate_timeout" per the frontend's own stream-closing logic.
+_sync_event_queues: dict[str, "asyncio.Queue[tuple[str, dict]]"] = {}
+
+
+async def _run_and_stream_browser_task(
+    *,
+    session_id: str,
+    task: str,
+    site: str,
+    player_name: str,
+    session_token: str,
+    model: str | None,
+    openrouter_key: str,
+    relay_base_url: str,
+) -> None:
+    """Runs run_browser_task in the background and streams its gate events +
+    final result onto _sync_event_queues[session_id]. This is a detached
+    asyncio.Task with no caller to propagate exceptions to, so the outer
+    try/except is not a fallback path — it is the one way to turn an
+    otherwise-swallowed exception into the single terminal SSE event the
+    frontend is waiting on, so the stream always terminates."""
+    queue = _sync_event_queues[session_id]
+
+    async def on_gate(evt: dict) -> None:
+        await queue.put(
+            (evt["event"], {"gate_id": evt["gate_id"], "kind": evt["kind"], "hint": evt["hint"], "url_host": evt["url_host"]})
+        )
+
+    try:
+        result = await run_browser_task(
+            task=task,
+            site=site,
+            player_name=player_name,
+            session_token=session_token,
+            openrouter_key=openrouter_key,
+            model=model or os.getenv("BROWSER_AGENT_MODEL", "openai/gpt-5.5"),
+            relay_base_url=relay_base_url,
+            on_gate=on_gate,
+        )
+    except Exception as exc:  # noqa: BLE001 - see docstring: terminates the SSE stream cleanly
+        await queue.put(
+            ("done", {"status": "llm_error", "matches": [], "steps_used": 0, "error": {"type": type(exc).__name__, "detail": str(exc)}})
+        )
+        await _stop_relay_session(session_token)  # E3
+        _sync_event_queues.pop(session_id, None)  # E4: also reached if the SSE side never connects
+        return
+
+    await queue.put(
+        ("done", {"status": result.status, "matches": result.matches, "steps_used": result.steps_used, "error": result.error})
+    )
+    await _stop_relay_session(session_token)  # E3
+    _sync_event_queues.pop(session_id, None)  # E4: also reached if the SSE side never connects
+
+
+async def _start_tier3_sync(*, task: str, site: str, player_name: str, model: str | None, request: Request) -> dict:
+    """Provisions a relay session, kicks off the browser-agent run in the
+    background, and returns {"session_id": ...} immediately — matching
+    StadiumSyncPanel.tsx's contract (POST resp: { session_id } | { error })."""
+    if not BROWSER_AGENT_AVAILABLE:
+        raise HTTPException(
+            status_code=503,
+            detail=f"browser_agent module not available yet: {_browser_agent_import_error}",
+        )
+
+    # S2: same charset/length/control-char rules as browser_agent's own
+    # run_browser_task boundary, enforced again here at the request boundary
+    # — before a relay session is minted for a bad name.
+    name_error = validate_player_name(player_name)
+    if name_error:
+        raise HTTPException(status_code=400, detail=f"Invalid player_name: {name_error}")
+    task_error = validate_task_text(task)
+    if task_error:
+        raise HTTPException(status_code=400, detail=f"Invalid task: {task_error}")
+
+    openrouter_key = _get_user_openrouter_key(request)
+    if not openrouter_key:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing BYOK key (X-User-Api-Key header) — required as the OpenRouter key for the browser agent.",
+        )
+
+    relay_base_url = _relay_base_url()
+    if not relay_base_url:
+        raise HTTPException(
+            status_code=500, detail="RELAY_URL is not configured on the server."
+        )
+
+    session = await _provision_relay_session()  # typed 503 when no companion is connected
+    session_token = session["session_token"]
+    session_id = session_token
+    _sync_event_queues[session_id] = asyncio.Queue()
+
+    asyncio.create_task(
+        _run_and_stream_browser_task(
+            session_id=session_id,
+            task=task,
+            site=site,
+            player_name=player_name,
+            session_token=session_token,
+            model=model,
+            openrouter_key=openrouter_key,
+            relay_base_url=relay_base_url,
+        )
+    )
+    return {"session_id": session_id}
+
+
+def _sse_response_for_sync_session(session_id: str) -> StreamingResponse:
+    queue = _sync_event_queues.get(session_id)
+    if queue is None:
+        raise HTTPException(status_code=404, detail=f"Unknown or expired sync session_id={session_id!r}")
+
+    async def _stream():
+        try:
+            while True:
+                try:
+                    event_name, data = await asyncio.wait_for(queue.get(), timeout=15.0)
+                except TimeoutError:
+                    # C2: keep the stream alive through Cloudflare's ~100s idle
+                    # cutoff during a silent gate wait.
+                    yield ": keepalive\n\n"
+                    continue
+                yield f"event: {event_name}\ndata: {json.dumps(data)}\n\n"
+                if event_name in ("done", "gate_timeout"):
+                    return
+        finally:
+            _sync_event_queues.pop(session_id, None)
+
+    return StreamingResponse(_stream(), media_type="text/event-stream")
+
+
+# Initialize BrowserManager for tools
+browser_manager = BrowserManager()
+
+# Global list to track active subprocesses
+active_processes = []
+
+
+async def run_script_managed(script_path: str, args: list | None = None, cwd: str | None = None):
+    """Helper to run a script, track it, and clean up after."""
+    if args is None:
+        args = []
+    if cwd is None:
+        cwd = os.path.dirname(script_path)
+
+    try:
+        process = await asyncio.create_subprocess_exec(
+            sys.executable or "python3",
+            script_path,
+            *args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=cwd,
+        )
+        active_processes.append(process)
+
+        stdout, stderr = await process.communicate()
+
+        # Cleanup
+        if process in active_processes:
+            active_processes.remove(process)
+
+        return process.returncode, stdout, stderr
+    except Exception as e:
+        # Attempt cleanup if something failed during setup
+        return -1, b"", str(e).encode()
+
+
+app = FastAPI(title="Rubberr — Table Tennis Intelligence")
+
+_LOCAL_ORIGINS = [
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://localhost:3002",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:3001",
+    "http://127.0.0.1:3002",
+]
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_LOCAL_ORIGINS,
+    # Any localhost / 127.0.0.1 / [::1] origin on any port (dev), plus the
+    # hosted previews. Without this, opening the app at 127.0.0.1:3000 instead
+    # of localhost:3000 silently blocks every API call.
+    allow_origin_regex=r"https://(.*\.onrender\.com|.*\.vercel\.app)|http://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?",
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# --- OpenPong service gate (optional, additive) ----------------------------
+# When OMNIPONG_SERVICE_TOKEN is set, every /agent/* request must carry
+# "Authorization: Bearer <token>". When it is unset (local dev), behavior is
+# exactly as before. Existing route logic and auth dependencies are untouched.
+@app.middleware("http")
+async def _omnipong_service_token_gate(request: Request, call_next):
+    token = os.getenv("OMNIPONG_SERVICE_TOKEN")
+    if token and request.method != "OPTIONS" and request.url.path.startswith("/agent/"):
+        if request.headers.get("Authorization") != f"Bearer {token}":
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "Missing or invalid Authorization: Bearer token."},
+            )
+    return await call_next(request)
+
+
+def _get_user_ai_key(request: Request) -> str | None:
+    """Return the user-supplied AI key from the X-User-Api-Key header."""
+    return request.headers.get("X-User-Api-Key") or None
+
+
+def _require_api_key(request: Request) -> None:
+    """Raise 401 if RUBBERR_API_KEY env var is set and request doesn't match."""
+    required = os.getenv("RUBBERR_API_KEY")
+    if not required:
+        return
+    provided = request.headers.get("X-Api-Key")
+    if provided != required:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+def _require_operator_token(request: Request) -> None:
+    """S1 hardening: owner-only gate on the Tier-3 sync + Tier-1 lookup
+    endpoints (/tools/sync/stadium, /tools/sync/omnipong, their
+    /events/{session_id} SSE routes, /tools/lookup/usatt). These endpoints
+    drive a real browser through the relay, so they must never be reachable
+    anonymously. Fails closed: if OPERATOR_TOKEN isn't configured, the
+    endpoint refuses (503) rather than running open — no fallback to "no
+    token configured = open"."""
+    required = os.getenv("OPERATOR_TOKEN")
+    if not required:
+        raise HTTPException(
+            status_code=503,
+            detail="OPERATOR_TOKEN is not configured on the server — owner-gated endpoints refuse to run open.",
+        )
+    provided = request.headers.get("X-Operator-Token")
+    if provided != required:
+        raise HTTPException(status_code=401, detail="Missing or invalid X-Operator-Token header.")
+
+# Database connection
+# Priority: env var (for Production/Render) > local sqlite file (Development)
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if DATABASE_URL:
+    # Fix for SQLAlchemy: Render uses 'postgres://' which is deprecated, replace with 'postgresql://'
+    if DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
+    engine = create_engine(DATABASE_URL)
+else:
+    # Local Development (SQLite). OMNIPONG_DB (added for OpenPong) overrides the
+    # SQLite file path; it defaults to <service root>/omnipong.db. No personal
+    # data file is required to boot — an empty DB is created on first run.
+    DB_PATH = os.getenv("OMNIPONG_DB") or os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "../omnipong.db")
+    )
+    DB_URL = f"sqlite:///{DB_PATH}"
+    engine = create_engine(DB_URL, connect_args={"check_same_thread": False})
+
+# Create tables if they don't exist (Critical for fresh Render DB)
+Base.metadata.create_all(bind=engine)
+
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+@app.get("/")
+def read_root():
+    return {"status": "Rubberr Backend Running"}
+
+
+@app.get("/demo")
+def get_demo_profile():
+    """Public read-only endpoint: returns the showcase player profile + recent stats.
+    Safe to expose — no PII beyond what's already public on USATT.
+    """
+    session = SessionLocal()
+    try:
+        user_row = session.execute(
+            text("SELECT name as full_name, current_rating as rating, usatt_id FROM users LIMIT 1")
+        ).fetchone()
+
+        stats_row = session.execute(
+            text("""
+                SELECT
+                    COUNT(*) as total_matches,
+                    SUM(CASE WHEN result = 'Win' THEN 1 ELSE 0 END) as wins,
+                    SUM(CASE WHEN result = 'Loss' THEN 1 ELSE 0 END) as losses
+                FROM matches
+            """)
+        ).fetchone()
+
+        recent = session.execute(
+            text("""
+                SELECT opponent_name, result, date as match_date, score_summary, set_scores
+                FROM matches
+                ORDER BY date DESC
+                LIMIT 10
+            """)
+        ).fetchall()
+
+        return {
+            "player": dict(user_row._mapping) if user_row else {},
+            "stats": dict(stats_row._mapping) if stats_row else {},
+            "recent_matches": [dict(r._mapping) for r in recent],
+            "demo": True,
+        }
+    except Exception as e:
+        return {"error": str(e), "demo": True}
+    finally:
+        session.close()
+
+
+@app.get("/user")
+def get_user():
+    session = SessionLocal()
+    try:
+        # Fetch the main user (the configured player)
+        result = session.execute(
+            text(
+                "SELECT name as full_name, current_rating as rating, usatt_id as usatt_number, phone_number FROM users LIMIT 1"
+            )
+        )
+        user = result.fetchone()
+
+        if user:
+            return dict(user._mapping)
+
+        # User requested NO auto-seeding. Strict DB state.
+        raise HTTPException(
+            status_code=404, detail="User not found in database. Run Sync."
+        )
+
+    except Exception as e:
+        print(f"Error fetching user: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        session.close()
+
+
+@app.get("/matches")
+def get_matches(source: str | None = None):
+    session = SessionLocal()
+    try:
+        # Build Query
+        query = "SELECT id, date, opponent_name, opponent_rating, score_summary, result, source, set_scores FROM matches"
+        params = {}
+
+        if source:
+            query += " WHERE source = :source"
+            params["source"] = source
+
+        query += " ORDER BY date DESC"
+
+        # Fetch detailed match history
+        result = session.execute(text(query), params)
+
+        matches = []
+        for row in result:
+            m = dict(row._mapping)
+
+            # Default flags
+            m["is_comeback"] = False
+            m["is_choke"] = False
+            m["is_close_game"] = False
+
+            sets_str = m.get("set_scores")
+            res_str = m.get("result")
+
+            # Determine Win/Loss
+            is_win = False
+            if res_str == "Win":
+                is_win = True
+            elif res_str and "-" in res_str:
+                try:
+                    p1, p2 = map(int, res_str.split("-"))
+                    if p1 > p2:
+                        is_win = True
+                except Exception:
+                    pass
+
+            # Parse Sets for Patterns
+            if sets_str:
+                try:
+                    # Clean and split "11-9, 9-11"
+                    set_list = [s.strip() for s in sets_str.split(",")]
+                    parsed_sets = []
+                    has_close_set = False
+
+                    for s in set_list:
+                        if "-" in s:
+                            try:
+                                sp1, sp2 = map(int, s.split("-"))
+                                parsed_sets.append((sp1, sp2))
+                                if abs(sp1 - sp2) <= 2:
+                                    has_close_set = True
+                            except Exception:
+                                pass
+
+                    m["is_close_game"] = has_close_set
+
+                    if len(parsed_sets) > 0:
+                        first_set = parsed_sets[0]
+                        s1_user, s1_opp = first_set
+                        won_first_set = s1_user > s1_opp
+
+                        if not won_first_set and is_win:
+                            m["is_comeback"] = True
+                        elif won_first_set and not is_win:
+                            m["is_choke"] = True
+
+                except Exception:
+                    m["is_win"] = is_win
+
+            matches.append(m)
+
+        return matches
+    except Exception as e:
+        print(f"Match fetch error: {e}")
+        return []
+    finally:
+        session.close()
+
+
+@app.delete("/matches/{match_id}")
+def delete_match(match_id: int):
+    session = SessionLocal()
+    try:
+        session.execute(text("DELETE FROM matches WHERE id = :id"), {"id": match_id})
+        session.commit()
+        return {"status": "success", "message": "Match deleted"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        session.close()
+
+
+@app.get("/matches/summary")
+def get_matches_summary(source: str | None = None):
+    """All of the user's match data in one place, grouped by year.
+
+    Returns {overall, years:[{year,total,wins,losses,win_rate,tournaments,
+    matches:[...]}]}. Used by the unified Tournaments page's "My Matches" view
+    so history is browsable year by year without clicking through tabs.
+    """
+    session = SessionLocal()
+    try:
+        query = (
+            "SELECT id, date, opponent_name, opponent_rating, score_summary, "
+            "result, source, set_scores FROM matches"
+        )
+        params = {}
+        if source:
+            query += " WHERE source = :source"
+            params["source"] = source
+        query += " ORDER BY date DESC"
+
+        rows = [dict(r._mapping) for r in session.execute(text(query), params)]
+
+        def _is_win(m: dict) -> bool:
+            res = m.get("result")
+            if res in ("Win", "W"):
+                return True
+            if res in ("Loss", "L"):
+                return False
+            if res and "-" in str(res):
+                try:
+                    a, b = map(int, str(res).split("-")[:2])
+                    return a > b
+                except Exception:
+                    return False
+            return False
+
+        def _is_scored(m: dict) -> bool:
+            """True only when a result exists.
+
+            Scheduled fixtures are stored with no result; counting them as
+            losses would silently wreck the record and win rate.
+            """
+            res = m.get("result")
+            if res in ("Win", "W", "Loss", "L"):
+                return True
+            return bool(res) and "-" in str(res)
+
+        buckets: dict = {}
+        for m in rows:
+            date_val = m.get("date")
+            year = str(date_val)[:4] if date_val else "Unknown"
+            m["is_win"] = _is_win(m)
+            b = buckets.setdefault(
+                year,
+                {
+                    "year": year,
+                    "total": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "unscored": 0,
+                    "dates": set(),
+                    "matches": [],
+                },
+            )
+            if not _is_scored(m):
+                b["unscored"] += 1
+            else:
+                b["total"] += 1
+                if m["is_win"]:
+                    b["wins"] += 1
+                else:
+                    b["losses"] += 1
+            dkey = str(date_val)[:10] if date_val else ""
+            if dkey:
+                b["dates"].add(dkey)
+            b["matches"].append(m)
+
+        years = []
+        for year in sorted(buckets.keys(), reverse=True):
+            b = buckets[year]
+            total = b["total"]
+            years.append(
+                {
+                    "year": year,
+                    "total": total,
+                    "wins": b["wins"],
+                    "losses": b["losses"],
+                    "unscored": b["unscored"],
+                    "win_rate": round(b["wins"] / total * 100) if total else 0,
+                    "tournaments": len(b["dates"]),
+                    "matches": b["matches"],
+                }
+            )
+
+        scored_rows = [m for m in rows if _is_scored(m)]
+        total = len(scored_rows)
+        wins = sum(1 for m in scored_rows if m["is_win"])
+        return {
+            "overall": {
+                "total": total,
+                "wins": wins,
+                "losses": total - wins,
+                "unscored": len(rows) - total,
+                "win_rate": round(wins / total * 100) if total else 0,
+            },
+            "years": years,
+        }
+    except Exception as e:
+        return {"error": str(e), "overall": {}, "years": []}
+    finally:
+        session.close()
+
+
+@app.post("/tournaments/signup")
+async def signup_tournament(
+    tournament_title: str, recommended_events: list[str] | None = None
+):
+    """Register for a tournament through the env-selected browser backend.
+
+    With OMNIPONG_BROWSER=relay this drives the user's own already-logged-in
+    browser through the relay/companion — no stored credential is read. With
+    the default local mode, the stored-credential path is used only when
+    OMNIPONG_ALLOW_STORED_CREDENTIALS=true. A relay-mode run with no companion
+    connected returns a typed 503 ("No companion connected — open OpenPong on
+    your computer and pair it") instead of hanging.
+    """
+    from browser_backend import BrowserBackendError, create_browser_manager
+
+    manager = None
+    try:
+        manager = create_browser_manager()
+        from omnipong_scraper import AsyncSessionLocal, OmniPongScraper
+
+        scraper = OmniPongScraper(manager)
+
+        result = await scraper.signup_for_tournament(
+            tournament_title, recommended_events
+        )
+
+        if result.get("status") == "success":
+            # Update DB status to 'Entered'
+            from sqlalchemy import select
+
+            from models import Activity
+
+            async with AsyncSessionLocal() as session:
+                stmt = select(Activity).where(Activity.title == tournament_title)
+                res = await session.execute(stmt)
+                activity = res.scalar_one_or_none()
+
+                if activity:
+                    activity.status = "Entered"
+                    # Also optionally update specific events if we want granular tracking
+                    await session.commit()
+                    print(f"Updated Activity '{tournament_title}' status to 'Entered'")
+
+        return result
+    except BrowserBackendError as exc:
+        # Typed, honest failure: nothing was registered. The typed shape lets
+        # the caller/coach report exactly why (e.g. no companion connected).
+        return JSONResponse(status_code=exc.status_code, content=exc.to_dict())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if manager is not None:
+            try:
+                await manager.stop()
+            except Exception:  # noqa: BLE001 - cleanup must not mask the real result
+                pass
+
+
+@app.get("/tournaments")
+def get_tournaments(region: str = "local"):
+    session = SessionLocal()
+    try:
+        # Fetch active tournaments. `source_id` carries the OmniPong row key
+        # (e.g. "T-tourney.asp?t=100&r=6157") which we turn into a real
+        # sign-up link on the frontend; `city_state` is the cleaned location.
+        result = session.execute(
+            text(
+                "SELECT title, location, city_state, date_range, status, flyer_url, "
+                "source_id, url, contact_email, last_scraped FROM activities "
+                "WHERE activity_type='tournament' ORDER BY id DESC"
+            )
+        )
+
+        # known TX cities for filtering
+        tx_cities = [
+            "plano",
+            "austin",
+            "houston",
+            "san antonio",
+            "dallas",
+            "richardson",
+            "irving",
+            "katy",
+            "allen",
+            "colleyville",
+            "round rock",
+            "fort worth",
+            "lubbock",
+            "el paso",
+            "arlington",
+        ]
+
+        tournaments = []
+        for row in result:
+            d = dict(row._mapping)
+
+            # Basic Location Check
+            loc_lower = (d["location"] or "").lower()
+            is_tx = any(city in loc_lower for city in tx_cities)
+
+            # Filtering Logic
+            if region == "local" and not is_tx:
+                continue
+
+            # Build a clickable OmniPong link. Prefer the per-row source_id
+            # (which includes the tournament + region ids); fall back to the
+            # stored url. This is what the "Open on OmniPong" button uses.
+            sid = (d.get("source_id") or "").strip()
+            if sid and not sid.lower().startswith("http"):
+                d["omnipong_url"] = f"https://www.omnipong.com/{sid.lstrip('/')}"
+            elif d.get("url"):
+                d["omnipong_url"] = d["url"]
+            else:
+                d["omnipong_url"] = "https://www.omnipong.com/t-tourney.asp?e=0"
+
+            # Real Data Only - No Mocks
+            # If we have real events/cost in DB later, fetch here. For now leave empty/null.
+            d["estimated_cost"] = None
+            d["events"] = None
+            d["tier"] = None
+
+            tournaments.append(d)
+
+        return tournaments
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        session.close()
+
+
+@app.get("/notifications")
+def get_notifications():
+    session = SessionLocal()
+    try:
+        # Fetch unread notifications
+        result = session.execute(
+            text(
+                "SELECT id, type, content, is_read, created_at FROM notifications WHERE is_read = 0 ORDER BY created_at DESC"
+            )
+        )
+        notifications = []
+        for row in result:
+            d = dict(row._mapping)
+            import json
+
+            try:
+                d["content"] = json.loads(d["content"])
+            except Exception:
+                pass
+            notifications.append(d)
+        return notifications
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        session.close()
+
+
+@app.post("/notifications/{notif_id}/read")
+def mark_notification_read(notif_id: int):
+    session = SessionLocal()
+    try:
+        session.execute(
+            text("UPDATE notifications SET is_read = 1 WHERE id = :id"), {"id": notif_id}
+        )
+        session.commit()
+        return {"status": "success"}
+    except Exception as e:
+        session.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        session.close()
+
+
+@app.post("/tools/check-tournaments")
+async def check_tournaments():
+    try:
+        script_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "../daily_check.py")
+        )
+        code, stdout, stderr = await run_script_managed(script_path)
+
+        if code == 0:
+            return {"status": "success", "log": stdout.decode()}
+        else:
+            return {"status": "error", "log": stderr.decode()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- OmniPong agent bridge ---
+# Exposes the same six actions as the MCP server (omnipong_mcp_server.py) so the
+# GUI "Agent" tab and any MCP client drive the exact same code path. See
+# docs/OMNIPONG_AGENT.md. The action list is served so the UI stays in sync.
+class AgentActionRequest(BaseModel):
+    action: str
+    params: dict = {}
+
+
+@app.get("/agent/actions")
+def agent_actions():
+    """List the actions the OmniPong agent exposes (mirrors ACTION_MAP)."""
+    from omnipong_agent import ACTION_MAP
+
+    return {"actions": sorted(ACTION_MAP.keys())}
+
+
+@app.post("/agent/action")
+async def agent_action(
+    req: AgentActionRequest, request: Request, _: None = Depends(_require_api_key)
+):
+    """Run one OmniPong agent action in-process and return its JSON result.
+
+    `action` is one of check|signup|search|sync|matches|tournaments; `params`
+    are passed straight through to omnipong_agent.run_action. Unknown actions
+    return a clean {status: error} dict rather than raising, so a bad action
+    name never 500s."""
+    from omnipong_agent import run_action
+
+    result = await run_action(req.action, **(req.params or {}))
+    return {"status": "ok", "action": req.action, "result": result}
+
+
+@app.post("/sync/omnipong")
+async def sync_omnipong():
+    try:
+        # Trigger OmniPong Autoscrape
+        script_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "../autoscrape.py")
+        )
+        code, stdout, stderr = await run_script_managed(script_path)
+
+        if code == 0:
+            return {"status": "success", "log": stdout.decode()}
+        else:
+            return {"status": "error", "log": stderr.decode()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    print("Shutting down backend...")
+    # 1. Stop BrowserManager
+    try:
+        await browser_manager.stop()
+        print("BrowserManager stopped.")
+    except Exception as e:
+        print(f"Error stopping BrowserManager: {e}")
+
+    # 2. Terminate all tracked subprocesses
+    for process in active_processes:
+        try:
+            if process.returncode is None:
+                print(f"Terminating background process {process.pid}")
+                process.terminate()
+                await process.wait()
+        except Exception as e:
+            print(f"Error terminating process {process.pid}: {e}")
+
+
+@app.post("/tools/sync/stadium")
+async def tool_sync_stadium(req: StadiumSyncStartRequest, request: Request):
+    """Tier-3: pull the user's OWN Stadium (stadiumcompete.com) match history
+    through their own already-logged-in browser via the relay — no stored
+    credentials, ever (RELAY_ARCHITECTURE.md §2/§5). The user logs into Stadium
+    themselves in their own Chrome; this only drives that tab.
+
+    Matches StadiumSyncPanel.tsx's contract: starts the run in the
+    background and returns {"session_id": ...} immediately; gate prompts and
+    the final result stream over GET /tools/sync/stadium/events (Phase 2
+    seam #1). Private per-user data is handed straight to the frontend for
+    the user's own IndexedDB ledger — it is NOT written to the server DB
+    (build plan: "private per-user scraped data lives in the user's browser").
+    """
+    _require_operator_token(request)
+    return await _start_tier3_sync(
+        task=(
+            "Open the Stadium (stadiumcompete.com) matches/dashboard for the "
+            "already logged-in user and extract their match history: for each "
+            "match, the opponent name, date, result, score summary, and set "
+            "scores."
+        ),
+        site="stadium",
+        player_name=req.player_name or PLAYER_FULL_NAME,
+        model=req.model,
+        request=request,
+    )
+
+
+@app.get("/tools/sync/stadium/events/{session_id}")
+async def tool_sync_stadium_events(session_id: str, request: Request) -> StreamingResponse:
+    """SSE push channel for the sync started by POST /tools/sync/stadium.
+    Event names/payloads match StadiumSyncPanel.tsx exactly: gate_open,
+    gate_cleared, gate_timeout, done (BrowserTaskResult).
+
+    S5: session_id (the relay session_token) is a path segment, not a query
+    string param — query strings land in proxy/access logs and browser
+    history, against RELAY_ARCHITECTURE.md §5's own rule."""
+    _require_operator_token(request)
+    return _sse_response_for_sync_session(session_id)
+
+
+@app.post("/tools/sync/omnipong")
+async def tool_sync_omnipong_personal(req: StadiumSyncStartRequest, request: Request):
+    """Tier-3: pull the user's OWN OmniPong match/tournament history through
+    their own already-logged-in browser via the relay. Same no-stored-creds,
+    background+SSE contract as /tools/sync/stadium — distinct from
+    /sync/omnipong, which refreshes the Tier-2 public feed under the owner's
+    own login."""
+    _require_operator_token(request)
+    return await _start_tier3_sync(
+        task=(
+            "Open the OmniPong (omnipong.com) 'My Matches' / tournament history "
+            "page for the already logged-in user and extract match results and "
+            "tournament entries."
+        ),
+        site="omnipong",
+        player_name=req.player_name or PLAYER_FULL_NAME,
+        model=req.model,
+        request=request,
+    )
+
+
+@app.get("/tools/sync/omnipong/events/{session_id}")
+async def tool_sync_omnipong_events(session_id: str, request: Request) -> StreamingResponse:
+    """SSE push channel for the sync started by POST /tools/sync/omnipong.
+    S5: session_id in the path, not the query string — see
+    tool_sync_stadium_events's docstring."""
+    _require_operator_token(request)
+    return _sse_response_for_sync_session(session_id)
+
+
+@app.get("/tools/lookup/usatt")
+async def tool_lookup_usatt(name: str, request: Request, session_token: str | None = None):
+    """Tier-1: public name -> USATT rating/tournament history lookup, no login.
+
+    USATT (usatt.simplycompete.com) is Cloudflare-walled against plain
+    requests/fetch (confirmed during Phase-0 spec research), so this cannot be
+    a server-side HTTP call — it must go through a REAL browser. Per the build
+    plan's Tier-1 row ("real browser via relay"), this reuses the same
+    browser-agent/relay path as Tier-3, but against a shared "public" companion
+    session that requires no personal login, rather than a per-visitor one.
+
+    Method + response shape match the frontend's contract exactly
+    (rubberr/frontend/src/app/lookup/page.tsx) — Phase 2 seam #3 resolved by
+    switching this endpoint from POST to GET (E's side) and reshaping the
+    response from the generic BrowserTaskResult.matches[] into
+    {status, player, rating_history, tournaments} (browser_agent.py's
+    site == "usatt" branch returns matches == [profile_dict] for exactly
+    this purpose, see extract_usatt_profile).
+
+    The shared public companion session is provisioned here (Phase 2 seam
+    #4) by calling relay POST /session/start with RELAY_PUBLIC_REGISTER_TOKEN
+    — the register token of an always-on companion+browser running on Y6
+    (see docs/PLATFORM_RUNBOOK.md). Callers may instead pass their own
+    session_token if they already have a live companion. If neither is
+    available this fails loudly with a clean 503 — no mocked/fake data is
+    ever returned.
+    """
+    _require_operator_token(request)
+    # S2: reject a bad `name` before minting a relay session for it.
+    if BROWSER_AGENT_AVAILABLE:
+        name_error = validate_player_name(name)
+        if name_error:
+            raise HTTPException(status_code=400, detail=f"Invalid name: {name_error}")
+
+    relay_base_url = _relay_base_url()
+    if not relay_base_url:
+        raise HTTPException(
+            status_code=500, detail="RELAY_URL is not configured on the server."
+        )
+
+    if session_token is None:
+        public_register_token = os.getenv("RELAY_PUBLIC_REGISTER_TOKEN")
+        if not public_register_token:
+            raise HTTPException(
+                status_code=503,
+                detail="No public relay companion configured (RELAY_PUBLIC_REGISTER_TOKEN unset).",
+            )
+        from browser_backend import BrowserBackendError, RelayConfig, provision_relay_session
+
+        public_config = RelayConfig(
+            url=relay_base_url.rstrip("/"),
+            token=(os.getenv("RELAY_TOKEN") or os.getenv("RELAY_OPERATOR_TOKEN") or "").strip() or None,
+            pairing_token=public_register_token,
+        )
+        try:
+            session_token = (await provision_relay_session(public_config))["session_token"]
+        except BrowserBackendError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    result = await _run_browser_agent_task(
+        task=f"Look up USATT rating/history/tournaments for '{name}'.",
+        site="usatt",
+        player_name=name,
+        session_token=session_token,
+        model=None,
+        request=request,
+    )
+    await _stop_relay_session(session_token)  # E3
+
+    if result.status != "ok":
+        return _browser_task_error(result)
+
+    profile = result.matches[0] if result.matches else {"not_found": True, "player": None, "rating_history": [], "tournaments": []}
+    if profile.get("not_found") or not profile.get("player"):
+        return {"status": "not_found", "message": f'No USATT record found for "{name}"'}
+
+    return {
+        "status": "success",
+        "player": profile["player"],
+        "rating_history": profile.get("rating_history") or [],
+        "tournaments": profile.get("tournaments") or [],
+    }
+
+
+@app.get("/tools/context")
+def get_agent_context():
+    session = SessionLocal()
+    try:
+        # 1. User Profile
+        user_res = session.execute(
+            text(
+                "SELECT name as full_name, current_rating as rating, usatt_id as usatt_number FROM users LIMIT 1"
+            )
+        ).fetchone()
+        user_data = dict(user_res._mapping) if user_res else {}
+
+        # 2. Recent Matches (Last 5)
+        matches_res = session.execute(
+            text(
+                "SELECT date, opponent_name, opponent_rating, result, score_summary, set_scores FROM matches ORDER BY date DESC LIMIT 5"
+            )
+        )
+        recent_matches = [dict(row._mapping) for row in matches_res]
+
+        # 3. Upcoming Tournaments (Next 3)
+        tourney_res = session.execute(
+            text(
+                "SELECT title, location, date_range, status FROM activities WHERE activity_type='tournament' ORDER BY id DESC LIMIT 3"
+            )
+        )
+        upcoming_tournaments = [dict(row._mapping) for row in tourney_res]
+
+        return {
+            "user": user_data,
+            "recent_matches": recent_matches,
+            "upcoming_tournaments": upcoming_tournaments,
+            "system_note": "Use this data to answer the user's questions about their table tennis career.",
+        }
+    except Exception as e:
+        print(f"Tool Context Error: {e}")
+        return {"error": str(e)}
+    finally:
+        session.close()
+
+
+@app.get("/stats")
+def get_stats(source: str = ""):
+    """Calculate live stats based on match history for a specific source"""
+    session = SessionLocal()
+    try:
+        # Base query for the source
+        # Note: source='omnipong' for USATT, 'stadium_league'/'stadium' for Club League
+        # Note: source='omnipong' for USATT, 'stadium_league'/'stadium' for Club League, 'arcade' for Arcade Mode
+        if not source or source == "all":
+            source_filter = "1=1"
+        elif source in ("usatt", "omnipong"):
+            source_filter = "source IN ('usatt', 'omnipong')"
+        elif source == "arcade":
+            source_filter = "source = 'arcade'"
+        else:
+            source_filter = "source IN ('stadium', 'stadium_league')"
+
+        # 1. Fetch all matches with relevant fields
+        query = text(f"SELECT result, set_scores FROM matches WHERE {source_filter}")
+        matches = session.execute(query, {"source": source}).fetchall()
+
+        total = len(matches)
+        wins = 0
+        losses = 0
+
+        # Pattern Tracking
+        close_sets_swung = 0
+        close_sets_won = 0
+        comebacks = 0  # Lost Set 1 -> Won Match
+        chokes = 0  # Won Set 1 -> Lost Match
+
+        for m in matches:
+            res_str = m[0]
+            sets_str = m[1]
+
+            # Determine Match Result
+            is_win = False
+            if res_str == "Win":
+                is_win = True
+            elif res_str and "-" in res_str:
+                try:
+                    p1, p2 = map(int, res_str.split("-"))
+                    if p1 > p2:
+                        is_win = True
+                except Exception:
+                    pass
+
+            if not res_str:
+                # Unsubmitted fixture: real match, no score yet. Never count it as a loss.
+                continue
+
+            if is_win:
+                wins += 1
+            else:
+                losses += 1
+
+            # Parse Set Scores for Patterns
+            if sets_str:
+                try:
+                    # Split "11-9, 9-11" -> ["11-9", "9-11"]
+                    set_list = [s.strip() for s in sets_str.split(",")]
+                    parsed_sets = []
+                    for s in set_list:
+                        if "-" in s:
+                            sp1, sp2 = map(int, s.split("-"))
+                            parsed_sets.append((sp1, sp2))
+
+                            # Close Game Analysis (diff <= 2)
+                            if abs(sp1 - sp2) <= 2:
+                                close_sets_swung += 1
+                                if sp1 > sp2:
+                                    close_sets_won += 1
+
+                    # Pattern: Comeback / Choke
+                    if len(parsed_sets) > 0:
+                        first_set = parsed_sets[0]
+                        # Assuming left number is User (scraped logic puts User score first usually?
+                        # Wait, scraper logic `p1Score = scoreMain[0]` -> `mainScore = p1-p2`.
+                        # In scraper, p1 is usually the "MatchCard-score" which is dynamic based on user side?
+                        # Actually in scraper: `validSets.push(`${s1}-${s2}`);` where s1 is first div.
+                        # Usually the "User" score is on the left if scraping logic is consistent.
+                        # Let's assume Left = User for now as Scraper tries to orient.
+
+                        s1_user, s1_opp = first_set
+                        won_first_set = s1_user > s1_opp
+
+                        if not won_first_set and is_win:
+                            comebacks += 1
+                        elif won_first_set and not is_win:
+                            chokes += 1
+
+                except Exception:
+                    # print(f"Error parsing sets: {ex}")
+                    pass
+
+        win_rate = round(wins / (wins + losses) * 100) if (wins + losses) > 0 else 0
+
+        # 2. Tournaments (Distinct Days)
+        tourney_query = text(
+            f"SELECT COUNT(DISTINCT date) FROM matches WHERE {source_filter}"
+        )
+        tourneys = session.execute(tourney_query, {"source": source}).scalar() or 0
+
+        # 3. Rating Trend: change across the filtered rating history (oldest -> newest)
+        trend_rows = session.execute(
+            text(f"SELECT rating FROM rating_history WHERE {source_filter} ORDER BY date ASC"),
+            {"source": source},
+        ).scalars().all()
+        if len(trend_rows) >= 2:
+            delta = int(round(float(trend_rows[-1]) - float(trend_rows[0])))
+            trend = f"{delta:+d}"
+        else:
+            trend = "0"
+
+        return {
+            "win_rate": f"{win_rate}%",
+            "wins": wins,
+            "losses": losses,
+            "tournaments": str(tourneys),
+            "trend": trend,
+            "rating_context": "All sources"
+            if not source or source == "all"
+            else (
+                "USATT Official"
+                if source in ("usatt", "omnipong")
+                else ("Arcade Mode" if source == "arcade" else "Club League")
+            ),
+            "patterns": {
+                "comebacks": comebacks,
+                "chokes": chokes,
+                "close_game_win_rate": round(close_sets_won / close_sets_swung * 100)
+                if close_sets_swung > 0
+                else 0,
+            },
+        }
+    except Exception as e:
+        print(f"Stats Error: {e}")
+        return {"error": str(e)}
+    finally:
+        session.close()
+
+
+@app.get("/rating_history")
+def get_rating_history(source: str = ""):
+    """Fetch user's rating progression over time"""
+    session = SessionLocal()
+    try:
+        # Match source filtering logic with other endpoints
+        if not source or source == "all":
+            source_filter = "1=1"
+        elif source in ("usatt", "omnipong"):
+            source_filter = "source IN ('usatt', 'omnipong')"
+        elif source == "arcade":
+            source_filter = "source = 'arcade'"
+        else:
+            source_filter = "source IN ('stadium', 'stadium_league')"
+
+        query = text(f"""
+            SELECT date, rating, notes 
+            FROM rating_history 
+            WHERE {source_filter}
+            ORDER BY date ASC
+        """)
+
+        result = session.execute(query)
+        history = [dict(row._mapping) for row in result]
+        return history
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        session.close()
+
+
+@app.post("/tools/sync/league")
+async def tool_sync_league(payload: LeagueSyncRequest | None = None):
+    """Sync the owner's league matches from the public STADIUM site.
+
+    The default path is login-free (*stadiumtt.com*). League URLs come from
+    ``STADIUMTT_LEAGUE_URLS`` (comma-separated) or the request body, and the
+    owner name from the request body, ``STADIUMTT_OWNER``/``OMNIPONG_OWNER`` or
+    the ``users`` table. ``legacy=true`` (or ``--legacy-login``) opts into the
+    old credential-based stadiumcompete scraper.
+    """
+    try:
+        from . import stadiumtt_scraper as stadiumtt
+
+        payload = payload or LeagueSyncRequest()
+        try:
+            urls = payload.league_urls or stadiumtt.parse_league_urls([])
+        except ValueError as exc:
+            return {
+                "status": "error",
+                "message": f"Invalid league URL configuration: {exc}",
+                "leagues": [],
+            }
+
+        owner = stadiumtt.resolve_owner(payload.owner)
+        if not owner:
+            owner = stadiumtt.to_last_first(_first_user_name())
+
+        if not urls and not payload.legacy:
+            message = (
+                "No league configured. Set STADIUMTT_LEAGUE_URLS to a public "
+                "stadiumtt.com tournament/league URL (comma-separated), or pass "
+                "league_urls in the request body. Refusing to guess a league."
+            )
+            return {
+                "status": "error",
+                "message": message,
+                "owner": owner,
+                "leagues": [],
+                "matches_seen": 0,
+                "inserted": 0,
+                "skipped_duplicates": 0,
+                "errors": [message],
+            }
+        if not owner:
+            message = (
+                "No owner player name resolved. Set STADIUMTT_OWNER, pass owner "
+                "in the request body, or add a row to the users table."
+            )
+            return {
+                "status": "error",
+                "message": message,
+                "leagues": [],
+                "matches_seen": 0,
+                "inserted": 0,
+                "skipped_duplicates": 0,
+                "errors": [message],
+            }
+
+        script_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "stadiumtt_scraper.py")
+        )
+        args = ["--json", "--owner", owner]
+        for url in urls:
+            args.extend(["--league-url", url])
+        if payload.all_matches:
+            args.append("--all-matches")
+        if payload.segments:
+            args.append("--segments")
+        if payload.legacy:
+            args.append("--legacy-login")
+
+        code, stdout, stderr = await run_script_managed(script_path, args)
+        summary = None
+        for line in stdout.decode(errors="replace").splitlines():
+            if line.startswith("STADIUMTT_JSON:"):
+                summary = json.loads(line[len("STADIUMTT_JSON:") :])
+
+        if summary is None:
+            return {
+                "status": "success" if code == 0 else "error",
+                "message": "League sync finished" if code == 0 else "League sync failed",
+                "owner": owner,
+                "leagues": [],
+                "matches_seen": 0,
+                "inserted": 0,
+                "skipped_duplicates": 0,
+                "errors": [] if code == 0 else [stderr.decode(errors="replace")],
+                "output": stdout.decode(errors="replace"),
+            }
+
+        success = code == 0 and summary.get("success", True)
+        return {
+            "status": "success" if success else "error",
+            "message": "League match history synced" if success else "League sync finished with errors",
+            "owner": summary.get("owner", owner),
+            "leagues": summary.get("leagues", []),
+            "matches_seen": summary.get("matches_seen", 0),
+            "owner_matches": summary.get("owner_matches", 0),
+            "inserted": summary.get("inserted", 0),
+            "updated": summary.get("updated", 0),
+            "skipped_duplicates": summary.get("skipped_duplicates", 0),
+            "errors": summary.get("errors", []),
+            "output": stdout.decode(errors="replace"),
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e), "leagues": [], "errors": [str(e)]}
+
+
+def _first_user_name() -> str | None:
+    """First non-empty ``users.name`` (works for SQLite and Postgres)."""
+    session = SessionLocal()
+    try:
+        row = session.execute(
+            text(
+                "SELECT name FROM users WHERE name IS NOT NULL AND TRIM(name) <> '' "
+                "ORDER BY id LIMIT 1"
+            )
+        ).fetchone()
+        return row[0] if row else None
+    except Exception:
+        return None
+    finally:
+        session.close()
+
+
+@app.post("/tools/sync/league_players")
+async def tool_sync_league_players():
+    """Trigger OmniPong search for all league players to sync USATT IDs and ratings"""
+    try:
+        # Use the absolute path to the sync script
+        script_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "../sync_omnipong_players.py")
+        )
+        code, stdout, stderr = await run_script_managed(script_path)
+
+        if code == 0:
+            return {
+                "status": "success",
+                "message": "League players synced successfully",
+                "output": stdout.decode(),
+            }
+        else:
+            return {"status": "error", "message": f"Sync failed: {stderr.decode()}"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.post("/tools/sync/tournaments")
+async def tool_sync_tournaments(scope: str = "regional"):
+    """
+    Trigger OmniPong tournament sync.
+    scopes: 'history' (my history), 'regional' (Region 8), 'all'
+    """
+    print(f"\n{'=' * 60}")
+    print("🎾 [BACKEND] Tournament sync endpoint called")
+    print(f"🎾 [BACKEND] Scope parameter: {scope}")
+    print(f"{'=' * 60}\n")
+
+    try:
+        script_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), "../sync_tournaments.py")
+        )
+        print(f"🎾 [BACKEND] Script path: {script_path}")
+        print(f"🎾 [BACKEND] Script exists: {os.path.exists(script_path)}")
+        print(
+            f"🎾 [BACKEND] Calling run_script_managed with args: ['--scope', '{scope}']"
+        )
+
+        code, stdout, stderr = await run_script_managed(script_path, ["--scope", scope])
+
+        print(f"🎾 [BACKEND] Script exit code: {code}")
+        print(f"🎾 [BACKEND] Script stdout length: {len(stdout)} bytes")
+        print(f"🎾 [BACKEND] Script stderr length: {len(stderr)} bytes")
+        print(f"🎾 [BACKEND] Script stdout:\n{stdout.decode()}")
+        if stderr:
+            print(f"🎾 [BACKEND] Script stderr:\n{stderr.decode()}")
+
+        if code == 0:
+            print("🎾 [BACKEND] Returning SUCCESS response")
+            return {
+                "status": "success",
+                "message": f"Tournament sync ({scope}) complete",
+                "output": stdout.decode(),
+            }
+        else:
+            print("🎾 [BACKEND] Returning ERROR response")
+            return {"status": "error", "message": f"Sync failed: {stderr.decode()}"}
+    except Exception as e:
+        print(f"🎾 [BACKEND] Exception caught: {type(e).__name__}: {e!s}")
+        import traceback
+
+        print(f"🎾 [BACKEND] Traceback:\n{traceback.format_exc()}")
+        return {"status": "error", "message": str(e)}
+
+
+@app.post("/tools/query/matches")
+def tool_query_matches(
+    opponent_name: str | None = None, date_from: str | None = None, result: str | None = None
+):
+    session = SessionLocal()
+    try:
+        query_str = "SELECT date, opponent_name, result, score_summary, set_scores FROM matches WHERE 1=1"
+        params = {}
+
+        if opponent_name:
+            query_str += " AND opponent_name LIKE :opp"
+            params["opp"] = f"%{opponent_name}%"
+        if date_from:
+            query_str += " AND date >= :dt"
+            params["dt"] = date_from
+        if result:
+            query_str += " AND result = :res"
+            params["res"] = result
+
+        query_str += " ORDER BY date DESC LIMIT 10"
+
+        res = session.execute(text(query_str), params)
+        matches = [dict(row._mapping) for row in res]
+        return matches
+    except Exception as e:
+        return {"error": str(e)}
+    finally:
+        session.close()
+
+
+@app.post("/tools/stats/calculate")
+def tool_stats_calculate(metric: str = "win_rate"):
+    # Reuse get_stats logic but flexible
+    return get_stats(source="omnipong")  # Default
+
+
+@app.post("/tools/query/tournaments")
+def tool_query_tournaments(location: str | None = None):
+    session = SessionLocal()
+    try:
+        query_str = "SELECT title, location, date_range, status FROM activities WHERE activity_type='tournament'"
+        params = {}
+        if location:
+            query_str += " AND location LIKE :loc"
+            params["loc"] = f"%{location}%"
+
+        res = session.execute(text(query_str), params)
+        return [dict(row._mapping) for row in res]
+    except Exception as e:
+        return {"error": str(e)}
+    finally:
+        session.close()
+
+
+@app.post("/tools/search/players")
+def tool_search_players(req: PlayerSearch):
+    """Search for a player in our local database (USATT ID, Rating, State)"""
+    session = SessionLocal()
+    try:
+        name = req.name
+        query_str = "SELECT name, usatt_id, rating, state FROM players WHERE 1=1"
+        params = {}
+        if name:
+            query_str += " AND (name LIKE :name OR usatt_id = :exact_id)"
+            params["name"] = f"%{name}%"
+            params["exact_id"] = name
+
+        res = session.execute(text(query_str), params)
+        players = [dict(row._mapping) for row in res]
+
+        # If not found in players table, check matches table for opponent_name
+        if not players and name:
+            match_res = session.execute(
+                text(
+                    "SELECT DISTINCT opponent_name as name, opponent_usatt_id as usatt_id, opponent_rating as rating FROM matches WHERE opponent_name LIKE :name AND opponent_rating IS NOT NULL"
+                ),
+                {"name": f"%{name}%"},
+            )
+            players = [dict(row._mapping) for row in match_res]
+
+        if not players:
+            return {
+                "status": "not_found",
+                "message": f"No player found locally matching '{name}'",
+            }
+
+        return {"status": "success", "players": players}
+    except Exception as e:
+        return {"error": str(e)}
+    finally:
+        session.close()
+
+
+# --- HELPER: Save Match Logic ---
+def save_arcade_match(
+    session,
+    opponent_name,
+    result,
+    score_summary,
+    set_scores,
+    date_obj=None,
+    *,
+    opponent_rating=None,
+    winner_name=None,
+    loser_name=None,
+    source="arcade",
+):
+    from datetime import datetime
+
+    from models import Match
+
+    # 1. Find/Create Opponent
+    opp_rating = 1200
+    existing_opp = session.execute(
+        text("SELECT rating FROM players WHERE name = :n"), {"n": opponent_name}
+    ).fetchone()
+    if existing_opp and existing_opp.rating:
+        opp_rating = existing_opp.rating
+
+    # 2. Create Match
+    new_match = Match(
+        date=date_obj if date_obj else datetime.now().date(),
+        opponent_name=opponent_name,
+        opponent_rating=opp_rating if opponent_rating is None else opponent_rating,
+        result=result,
+        score_summary=score_summary,
+        set_scores=set_scores,
+        winner_name=winner_name,
+        loser_name=loser_name,
+        source=source,
+        activity_id=None,
+    )
+    session.add(new_match)
+    session.commit()
+    return new_match
+
+
+class ManualMatchRequest(BaseModel):
+    """Body for POST /tools/matches — a result the owner reports by hand.
+
+    `set_scores` is owner-first: a flat list of games ([11, 9, 11, 8]) or the
+    string form ("11-9, 11-8"). `source` defaults to the arcade bucket so a
+    manually logged result sits with other self-reported matches.
+    """
+
+    date: str
+    opponent_name: str
+    opponent_rating: int | None = None
+    result: Literal["Win", "Loss"]
+    score_summary: str | None = None
+    set_scores: list[int] | str | None = None
+    source: str = "arcade"
+
+
+def _manual_match_owner() -> str | None:
+    """Owner name from the ``users`` table, then the configured env fallback."""
+    name = _first_user_name()
+    if name and name.strip():
+        return name.strip()
+    for env_name in ("OMNIPONG_OWNER", "STADIUMTT_OWNER"):
+        value = (os.getenv(env_name) or "").strip()
+        if value:
+            return value
+    return None
+
+
+def _parse_manual_match_date(value: str) -> datetime:
+    raw = (value or "").strip()
+    if not raw:
+        raise ValueError("date is required (ISO date, e.g. 2026-11-16)")
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"date must be an ISO date like 2026-11-16 (got {raw!r})") from exc
+    return datetime(parsed.year, parsed.month, parsed.day)
+
+
+def _normalize_manual_set_scores(value: list[int] | str | None) -> str | None:
+    """Owner-first games -> the "11-9, 11-8" string the existing readers parse."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        cleaned = value.strip()
+        return cleaned or None
+    if not value:
+        return None
+    if len(value) % 2 != 0:
+        raise ValueError("set_scores must be pairs of games (owner first, then opponent)")
+    for score in value:
+        if score < 0 or score > 99:
+            raise ValueError("set_scores games must be between 0 and 99")
+    return ", ".join(
+        f"{value[index]}-{value[index + 1]}" for index in range(0, len(value), 2)
+    )
+
+
+@app.post("/tools/matches")
+def record_manual_match(req: ManualMatchRequest):
+    """Record one match result the owner reported.
+
+    This is the only write path for manual results: it reuses
+    ``save_arcade_match`` (so inserts stay in one place), derives the winner and
+    loser from the owner row in ``users``, and is idempotent per
+    (date, opponent_name, score_summary, source) — a repeated POST returns the
+    existing row with ``created:false`` instead of a duplicate.
+    """
+    owner = _manual_match_owner()
+    if not owner:
+        raise HTTPException(
+            status_code=400,
+            detail="No owner name in the users table. Add one or set OMNIPONG_OWNER.",
+        )
+    opponent = (req.opponent_name or "").strip()
+    if not opponent:
+        raise HTTPException(status_code=400, detail="opponent_name is required")
+    if req.opponent_rating is not None and not 0 <= req.opponent_rating <= 4000:
+        raise HTTPException(status_code=400, detail="opponent_rating must be between 0 and 4000")
+    source = (req.source or "arcade").strip() or "arcade"
+    try:
+        match_date = _parse_manual_match_date(req.date)
+        set_scores = _normalize_manual_set_scores(req.set_scores)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    score_summary = (req.score_summary or "").strip() or None
+    winner_name = owner if req.result == "Win" else opponent
+    loser_name = opponent if req.result == "Win" else owner
+
+    session = SessionLocal()
+    try:
+        duplicate = session.execute(
+            text(
+                "SELECT id FROM matches "
+                "WHERE date = :date AND opponent_name = :opponent AND source = :source "
+                "AND COALESCE(score_summary, '') = :score "
+                "AND (winner_name = :owner OR loser_name = :owner) "
+                "ORDER BY id LIMIT 1"
+            ).bindparams(bindparam("date", type_=DateTime)),
+            {
+                "date": match_date,
+                "opponent": opponent,
+                "source": source,
+                "score": score_summary or "",
+                "owner": owner,
+            },
+        ).fetchone()
+        if duplicate:
+            return {"status": "success", "match_id": duplicate[0], "created": False}
+
+        new_match = save_arcade_match(
+            session,
+            opponent,
+            req.result,
+            score_summary,
+            set_scores,
+            match_date,
+            opponent_rating=req.opponent_rating,
+            winner_name=winner_name,
+            loser_name=loser_name,
+            source=source,
+        )
+        return {"status": "success", "match_id": new_match.id, "created": True}
+    except HTTPException:
+        raise
+    except Exception as e:
+        session.rollback()
+        print(f"Manual match error: {e}")
+        raise HTTPException(status_code=500, detail=f"Could not record the match: {e}") from e
+    finally:
+        session.close()
+
+
+# --- MULTI-MODAL & AI HANDLERS ---
+import os
+import shutil
+
+from fastapi import File, Request, Response, UploadFile
+
+from .ai_handler import parse_match_intent, transcribe_audio
+
+
+@app.post("/arcade/transcribe")
+async def arcade_transcribe(file: UploadFile = File(...)):
+    """
+    Accepts an audio file, transcribes it, and parses match intent using LLM.
+    """
+    temp_filename = f"temp_{file.filename}"
+    try:
+        # Save temp file
+        with open(temp_filename, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+
+        # Transcribe
+        transcript = await transcribe_audio(temp_filename)
+
+        # Parse
+        parsed = await parse_match_intent(transcript)
+
+        return {
+            "status": "success",
+            "transcript": transcript,
+            "intent": parsed.get("intent"),
+            "confirmation": parsed.get("confirmation_message"),
+            "missing": parsed.get("missing_info"),
+        }
+    except Exception as e:
+        print(f"❌ Transcribe Error: {e}")
+        return {
+            "status": "error",
+            "error": str(e),
+            "transcript": "Error during processing",
+            "intent": {},
+        }
+    finally:
+        if os.path.exists(temp_filename):
+            os.remove(temp_filename)
+
+
+@app.post("/arcade/process")
+async def arcade_process(req: ProcessText):
+    """
+    Accepts raw text (e.g. from local iOS Speech-to-Text), and parses match intent.
+    """
+    try:
+        # Parse text directly
+        parsed = await parse_match_intent(req.text)
+
+        return {
+            "status": "success",
+            "transcript": req.text,
+            "intent": parsed.get("intent"),
+            "confirmation": parsed.get("confirmation_message"),
+            "missing": parsed.get("missing_info"),
+        }
+    except Exception as e:
+        print(f"❌ Process Error: {e}")
+        return {
+            "status": "error",
+            "error": str(e),
+            "transcript": req.text,
+            "intent": {},
+        }
+
+
+@app.post("/webhooks/twilio")
+async def twilio_webhook(request: Request):
+    """Inbound SMS from Twilio: verify the signature, then answer by rule.
+
+    Deliberately rule-based: an inbound text must never be able to spend the
+    owner's model budget. Anything unrecognised gets the command list.
+    """
+    form = await request.form()
+    params = form_to_params(form)
+    signed_url = public_url_for(str(request.url))
+    if not verify_signature(request.headers.get("X-Twilio-Signature"), signed_url, params):
+        return JSONResponse({"error": "Invalid Twilio signature"}, status_code=403)
+
+    body = params.get("Body", "")
+    command = command_from_body(body)
+    try:
+        if command == "matches":
+            reply = format_matches({"matches": get_matches()})
+        elif command == "tournaments":
+            reply = format_tournaments({"tournaments": get_tournaments("all")})
+        elif command == "rating":
+            user = get_user()
+            reply = (
+                f"Your rating is {user.get('rating')} "
+                f"(USATT #{user.get('usatt_number') or 'unknown'})."
+            )
+        elif command == "sync":
+            reply = (
+                "Sync runs on your OpenPong dashboard - open it and press Sync. "
+                "A full league pull takes a few minutes."
+            )
+        else:
+            reply = HELP_TEXT
+    except Exception as exc:  # never let a webhook 500 on Twilio
+        log.warning("twilio command %s failed: %s", command, exc)
+        reply = "OpenPong could not read that right now. Try again in a minute."
+
+    escaped = escape(reply)
+    return Response(
+        content=f'<?xml version="1.0" encoding="UTF-8"?><Response><Message>{escaped}</Message></Response>',
+        media_type="application/xml",
+    )
+
+
+# --- OUTBOUND SMS ---
+
+
+class SmsNotify(BaseModel):
+    body: str
+    to: str | None = None
+
+
+@app.post("/tools/sms/notify")
+def sms_notify(data: SmsNotify, request: Request):
+    """Send one outbound text to the owner (scout alerts, receipts).
+
+    The recipient is never guessed from the request body when the owner has a
+    phone number on file; ``to`` is only honoured for a caller that already
+    presented the service token. Returns ``sent: false`` with a reason instead
+    of failing, because an SMS outage must never fail the job that triggered it.
+    """
+    from .twilio_sms import normalize_number, send_sms, sms_configured
+
+    if not sms_configured():
+        return {
+            "status": "success",
+            "sent": False,
+            "detail": "Twilio is not configured (TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / TWILIO_FROM_NUMBER).",
+        }
+
+    body = (data.body or "").strip()
+    if not body:
+        return {"status": "success", "sent": False, "detail": "Nothing to send."}
+
+    session = SessionLocal()
+    try:
+        row = session.execute(
+            text("SELECT phone_number FROM users WHERE phone_number IS NOT NULL LIMIT 1")
+        ).fetchone()
+        owner_phone = (row[0] if row else None) or None
+    except Exception:
+        owner_phone = None
+    finally:
+        session.close()
+
+    # An explicit recipient is only trusted from a caller that presented the
+    # service token (or from a local install with no token configured at all);
+    # otherwise the text can only ever go to the number on file.
+    service_token = os.getenv("OMNIPONG_SERVICE_TOKEN")
+    trusted_caller = not service_token or request.headers.get("Authorization") == f"Bearer {service_token}"
+    explicit_to = data.to if trusted_caller else None
+    to = normalize_number(owner_phone or explicit_to or os.getenv("OMNIPONG_SMS_TO") or "")
+    if not to:
+        return {
+            "status": "success",
+            "sent": False,
+            "detail": "No phone number on file. Add one in OpenPong Settings.",
+        }
+
+    sent, detail = send_sms(to, body)
+    return {"status": "success", "sent": sent, "to": to, "detail": detail}
+
+
+# --- ARCADE MODE ENDPOINTS ---
+
+
+class ArcadeScoreSubmission(BaseModel):
+    transcript: str = None
+    manual_score: str = None
+    # Support both old and new field names
+    opponent_name: str = None  # Old field (for backward compatibility)
+    player1_name: str = None  # New field
+    player2_name: str = None  # New field
+    date: str = None  # YYYY-MM-DD
+
+
+@app.post("/arcade/lookup_player")
+def arcade_lookup_player(req: PlayerSearch):
+    """
+    Find or Create a local player for Arcade Mode.
+    If player exists (by name), return info.
+    If not, return basic info (can default to 1200 or estimate).
+    """
+    session = SessionLocal()
+    try:
+        name = req.name
+        if not name:
+            return {"status": "error", "message": "Name is required"}
+
+        # Case insensitive search
+        player = session.execute(
+            text("SELECT * FROM players WHERE name LIKE :name"), {"name": name}
+        ).fetchone()
+
+        if player:
+            return {"status": "found", "player": dict(player._mapping)}
+        else:
+            return {"status": "not_found", "message": "Player not found in database."}
+    except Exception as e:
+        return {"error": str(e)}
+    finally:
+        session.close()
+
+
+@app.post("/arcade/submit_score")
+async def arcade_submit_score(data: ArcadeScoreSubmission):
+    """
+    Parse and submit a score for Arcade Mode.
+    Handles natural language input like 'I won 3-0' or '11-9, 11-8...'.
+    Uses the same AI logic as the SMS agent for high accuracy.
+    """
+    session = SessionLocal()
+    try:
+
+        # 1. Smarter AI Parsing
+        # Use the same logic as the Twilio agent if transcript is provided
+        raw_input = data.transcript or data.manual_score or ""
+
+        result = "Win"
+        score_summary = data.manual_score or "3-0"
+        set_scores = ""
+        confirmation = ""
+
+        if raw_input:
+            try:
+                parsed = await parse_match_intent(raw_input)
+                intent = parsed.get("intent", {})
+
+                # Extract values from AI parsing (support both old and new field names)
+                u_score = intent.get("player1_score") or intent.get("user_score")
+                o_score = intent.get("player2_score") or intent.get("opponent_score")
+                if u_score is not None and o_score is not None:
+                    result = "Win" if u_score > o_score else "Loss"
+                    score_summary = f"{u_score}-{o_score}"
+                    set_scores = intent.get("set_scores", "")
+                    confirmation = parsed.get("confirmation_message", "")
+            except Exception as ai_err:
+                print(f"AI Parse Error: {ai_err}")
+                return {
+                    "status": "error",
+                    "message": f"AI Parsing failed: {ai_err!s}",
+                }
+
+        # 2. Save Match to DB
+        from models import Match
+
+        # Support both old and new field names - fully dynamic, no hardcoded names
+        user_name = data.player1_name or "User"  # Default to generic if not provided
+        opp_name = (
+            data.player2_name or data.opponent_name
+        )  # Prefer new field, fallback to old
+
+        if not opp_name:
+            return {"status": "error", "message": "Missing opponent/player2 name"}
+
+        # If only opponent provided (legacy), infer user_name from AI intent if available
+        if user_name == "User" and raw_input:
+            if intent.get("player1_name"):
+                user_name = intent["player1_name"]
+
+        opp_rating = 1200  # Default
+
+        # Try to find existing rating
+        existing_opp = session.execute(
+            text("SELECT rating FROM players WHERE name = :n"), {"n": opp_name}
+        ).fetchone()
+        if existing_opp and existing_opp.rating:
+            opp_rating = existing_opp.rating
+
+        # Handle Date/Time (Support full ISO or simple date)
+        match_dt = datetime.now()
+        if data.date:
+            try:
+                # Try full ISO8601 first
+                match_dt = datetime.fromisoformat(data.date.replace("Z", "+00:00"))
+            except ValueError:
+                try:
+                    # Fallback to simple date
+                    match_dt = datetime.strptime(data.date, "%Y-%m-%d")
+                except Exception:
+                    pass
+
+        # Determine Winner/Loser names for the record
+        winner_name = user_name if result == "Win" else opp_name
+        loser_name = opp_name if result == "Win" else user_name
+
+        new_match = Match(
+            date=match_dt,
+            opponent_name=opp_name,
+            opponent_rating=opp_rating,
+            winner_name=winner_name,
+            loser_name=loser_name,
+            result=result,
+            score_summary=score_summary,  # Overall "3-1"
+            set_scores=set_scores,  # Detailed "11-9, 9-11"
+            source="arcade",
+            activity_id=None,  # Not linked to a tournament/league
+        )
+
+        session.add(new_match)
+        session.commit()
+
+        return {
+            "status": "success",
+            "match_id": new_match.id,
+            "summary": f"Recorded {result} vs {opp_name} ({score_summary})",
+            "confirmation": confirmation,
+        }
+
+    except Exception as e:
+        session.rollback()
+        print(f"Arcade Submit Error: {e}")
+        return {"error": str(e)}
+    finally:
+        session.close()
+
+
+def get_practice_partners(limit: int = 5):
+    """
+    Analyze match history to recommend optimal practice partners.
+    Considers: skill level match, competitiveness, frequency of play, and improvement potential.
+    """
+    session = SessionLocal()
+    try:
+        # Get all matches with opponent data
+        query = text("""
+            SELECT
+                opponent_name,
+                opponent_rating,
+                result,
+                set_scores,
+                date,
+                score_summary
+            FROM matches
+            WHERE opponent_name IS NOT NULL
+            ORDER BY date DESC
+        """)
+
+        result = session.execute(query)
+        matches = [dict(row._mapping) for row in result]
+
+        # Get user's current rating (approximate from recent matches)
+        user_rating_query = text("""
+            SELECT current_rating FROM users LIMIT 1
+        """)
+        user_rating_result = session.execute(user_rating_query).scalar()
+        if not user_rating_result:
+            # Never borrow a fabricated 1500: fall back to the newest rated
+            # session in the owner's own history before giving up.
+            user_rating_result = session.execute(
+                text("SELECT rating FROM rating_history ORDER BY date DESC LIMIT 1")
+            ).scalar()
+        user_rating = user_rating_result or 1500  # Last resort for a totally empty ledger
+
+        # Analyze opponents
+        opponent_stats = {}
+
+        for match in matches:
+            opp_name = match["opponent_name"]
+            if not opp_name:
+                continue
+
+            if opp_name not in opponent_stats:
+                opponent_stats[opp_name] = {
+                    "name": opp_name,
+                    "rating": match["opponent_rating"],
+                    "matches_played": 0,
+                    "wins": 0,
+                    "losses": 0,
+                    "close_matches": 0,
+                    "last_played": match["date"],
+                    "recent_trend": [],  # Track recent results
+                }
+
+            stats = opponent_stats[opp_name]
+            stats["matches_played"] += 1
+
+            # Track wins/losses
+            if match["result"] in ["W", "Win"]:
+                stats["wins"] += 1
+                stats["recent_trend"].append("W")
+            else:
+                stats["losses"] += 1
+                stats["recent_trend"].append("L")
+
+            # Detect close matches
+            set_scores = match.get("set_scores", "")
+            if set_scores:
+                try:
+                    sets = set_scores.split(",")
+                    for s in sets:
+                        s = s.strip()
+                        if "-" in s:
+                            s1, s2 = map(int, s.split("-"))
+                            if abs(s1 - s2) <= 2:  # Close set
+                                stats["close_matches"] += 1
+                                break
+                except Exception:
+                    pass
+
+        # Score each opponent for practice value
+        recommendations = []
+
+        for opp_name, stats in opponent_stats.items():
+            if stats["matches_played"] < 1:
+                continue
+
+            score = 0
+            reasons = []
+
+            # 1. Skill Level Match (higher score for similar rating ±150)
+            rating_diff = abs((stats["rating"] or user_rating) - user_rating)
+            if rating_diff <= 50:
+                score += 30
+                reasons.append("Similar skill level (perfect practice match)")
+            elif rating_diff <= 150:
+                score += 20
+                reasons.append("Good skill level match")
+            elif stats["rating"] and stats["rating"] > user_rating:
+                score += 15
+                reasons.append("Higher rated (challenging practice)")
+
+            # 2. Competitiveness (close matches are valuable)
+            close_match_rate = stats["close_matches"] / stats["matches_played"]
+            if close_match_rate >= 0.5:
+                score += 25
+                reasons.append("Very competitive matches (high learning potential)")
+            elif close_match_rate > 0:
+                score += 15
+                reasons.append("Competitive matches")
+
+            # 3. Win Rate (ideal is 40-60% for growth)
+            win_rate = stats["wins"] / stats["matches_played"]
+            if 0.4 <= win_rate <= 0.6:
+                score += 25
+                reasons.append("Balanced win/loss record (optimal for improvement)")
+            elif 0.3 <= win_rate < 0.4:
+                score += 15
+                reasons.append("Challenging opponent (room to improve)")
+            elif win_rate < 0.3:
+                score += 10
+                reasons.append("Tough opponent (valuable for growth)")
+
+            # 4. Frequency (regular practice partners are valuable)
+            if stats["matches_played"] >= 5:
+                score += 15
+                reasons.append("Regular practice partner")
+            elif stats["matches_played"] >= 3:
+                score += 10
+                reasons.append("Familiar opponent")
+
+            # 5. Recent Activity (prefer players you can still practice with)
+            try:
+                from datetime import datetime
+
+                last_played = datetime.strptime(str(stats["last_played"]), "%Y-%m-%d")
+                days_since = (datetime.now() - last_played).days
+                if days_since <= 30:
+                    score += 10
+                    reasons.append("Recently played")
+                elif days_since <= 90:
+                    score += 5
+            except Exception:
+                pass
+
+            # --- Normalize Scores for Frontend (0.0 to 1.0) ---
+
+            # 1. Skill Match Score (1.0 if within 50pts, decay linearly to 0 at 400pts diff)
+            skill_score = max(0, 1 - (rating_diff / 400))
+            if rating_diff <= 50:
+                skill_score = 1.0
+
+            # 2. Competitiveness Score (Percent of close matches)
+            comp_score = min(
+                1.0, close_match_rate * 1.5
+            )  # Boost it a bit so 33% close is 0.5 score
+
+            # 3. Win Rate Balance (Bell curve peaking at 0.5)
+            # Optimal is 0.5. Distance from 0.5: abs(win_rate - 0.5). Max dist is 0.5.
+            # Score = 1 - (dist * 2) -> If 0.5, dist 0, score 1. If 1.0 or 0.0, dist 0.5, score 0.
+            balance_score = 1.0 - (abs(win_rate - 0.5) * 2)
+
+            # 4. Recent Activity Score
+            recent_score = 0.0
+            try:
+                from datetime import datetime
+
+                last_played = datetime.strptime(str(stats["last_played"]), "%Y-%m-%d")
+                days_since = (datetime.now() - last_played).days
+                recent_score = max(0, 1 - (days_since / 90))  # Decay over 3 months
+            except Exception:
+                pass
+
+            # Aggregate Total Score (Weighted Average)
+            total_weighted_score = (
+                (skill_score * 0.3)
+                + (comp_score * 0.3)
+                + (balance_score * 0.3)
+                + (recent_score * 0.1)
+            )
+
+            recommendations.append(
+                {
+                    "player_name": opp_name,
+                    "rating": stats["rating"],
+                    "wins": stats["wins"],
+                    "losses": stats["losses"],
+                    "match_count": stats["matches_played"],
+                    "total_score": round(total_weighted_score, 2),
+                    "reason": reasons[0] if reasons else "Good practice partner",
+                    "last_played": str(stats["last_played"]),
+                    "scores": {
+                        "skill_match": round(skill_score, 2),
+                        "competitiveness": round(comp_score, 2),
+                        "win_rate_balance": round(balance_score, 2),
+                        "recent_activity": round(recent_score, 2),
+                    },
+                }
+            )
+
+        # Sort by score and return top recommendations
+        recommendations.sort(key=lambda x: x["total_score"], reverse=True)
+
+        return {
+            "user_rating": user_rating,
+            "recommendations": recommendations[:limit],
+            "total_opponents": len(opponent_stats),
+            "analysis": f"Analyzed {len(matches)} matches against {len(opponent_stats)} different opponents",
+        }
+
+    except Exception as e:
+        return {"error": str(e)}
+    finally:
+        session.close()
+
+
+# Removed definition of get_tournament_intelligence here as it is now imported.
+
+
+@app.get("/tools/stats")
+def get_tool_stats():
+    """Tool-specific endpoint for stats summary"""
+    return get_stats(source="omnipong")
+
+
+@app.get("/tools/analysis")
+def get_tool_analysis():
+    """Tool-specific endpoint for match analysis context"""
+    session = SessionLocal()
+    try:
+        # Fetch some analysis patterns (comebacks, chokes)
+        stats = get_stats(source="omnipong")
+        # Fetch some recent close matches
+        result = session.execute(
+            text(
+                "SELECT date, opponent_name, result, set_scores FROM matches WHERE set_scores LIKE '%11-9%' OR set_scores LIKE '%9-11%' LIMIT 3"
+            )
+        )
+        close_matches = [dict(row._mapping) for row in result]
+
+        return {
+            "summary": stats,
+            "notable_matches": close_matches,
+            "instruction": "Explain these patterns to the user. For example, if they have many chokes, suggest focus on late-game composure.",
+        }
+    except Exception as e:
+        return {"error": str(e)}
+    finally:
+        session.close()
+
+
+@app.get("/tools/practice_partners")
+def get_tool_practice_partners(limit: int = 5):
+    """Tool-specific endpoint for practice partner recommendations"""
+    return get_practice_partners(limit=limit)
+
+
+@app.get("/tools/tournament_intelligence")
+def get_tool_tournament_intelligence(tournament_title: str | None = None, limit: int = 5):
+    """Tool-specific endpoint for AI-enhanced tournament recommendations"""
+    return get_tournament_intelligence(tournament_title=tournament_title, limit=limit)
+
+
+@app.get("/tools/results/omnipong")
+def get_tool_omnipong_results(tid: str, eid: str):
+    """Read-only: public OmniPong event draws/results for one tournament round.
+
+    Plain HTTP GET of ``T-tourney.asp?t=<tid>&r=<eid>`` (no login, no browser —
+    see backend/omnipong_results.py). Non-public pages (login shell, DataFlex
+    error page, no results table) come back as ``{"error": ...}`` instead of a
+    500, matching the neighbouring /tools/* routes; an empty results table is a
+    legitimate ``events: []``.
+    """
+    try:
+        from .omnipong_results import fetch_event_results
+
+        return fetch_event_results(tid, eid)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ============================================
+# CHAT ENDPOINT - Text-based AI Agent
+# ============================================
+# ============================================
+# CHAT ENDPOINT - Claude 4 AI Agent with Tools
+# ============================================
+
+# System Prompt to define the AI's persona and context
+SYSTEM_PROMPT = f"""You are 'Coach Rubberr', a world-class AI table tennis coach and analyst.
+You help user '{PLAYER_NAME}' manage their table tennis career by analyzing match data, tracking progress, and finding tournaments.
+
+CONCISENESS IS CRITICAL:
+- Be extremely concise and direct. 
+- Avoid long introductory summaries unless explicitly asked for a career summary.
+- If the user says "hi", just say hi back and ask how you can help. 
+- Do not dump all the user's stats, matches, and tournaments at once unless requested.
+- Use tools ONLY to answer the specific question asked.
+
+Persona:
+- Professional, encouraging, and human-like.
+- Provide psychological insights only when relevant to a specific match or trend being discussed.
+- You are {PLAYER_NAME}'s personal coach. Be helpful but don't over-explain.
+
+DATA STRATEGY:
+1. ALWAYS start with `get_context` to see the current state.
+2. If looking for a specific player's info (rating/rank), ALWAYS use `search_players` first.
+3. Use `omnipong_player_search` ONLY as a fallback of last resort if the player is not found locally.
+4. If the user asks about a specific match result, use `query_matches`.
+"""
+
+
+def get_anthropic_client():
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise ValueError("ANTHROPIC_API_KEY not found in environment")
+    return anthropic.Anthropic(api_key=api_key)
+
+
+# Tool definitions for Claude
+CLAUDE_TOOLS = [
+    {
+        "name": "get_context",
+        "description": "Get high-level summary context (user profile, recent matches, upcoming tournaments).",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_stats",
+        "description": "Get the player's current stats (win rate, trend, patterns) for USATT or Club League.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "source": {
+                    "type": "string",
+                    "enum": ["usatt", "club"],
+                    "description": "The data source.",
+                }
+            },
+        },
+    },
+    {
+        "name": "query_matches",
+        "description": "Search the player's match history with filters.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "opponent_name": {
+                    "type": "string",
+                    "description": "Search for a specific opponent.",
+                },
+                "date_from": {"type": "string", "description": "YYYY-MM-DD format."},
+                "result": {"type": "string", "enum": ["Win", "Loss"]},
+            },
+        },
+    },
+    {
+        "name": "get_performance_analysis",
+        "description": "Get deeper analysis of performance patterns (chokes/comebacks/set-by-set trends).",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "search_players",
+        "description": "Search our local database for a player's rating, USATT ID, and state. Use this before trying external searches.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "The player's name or USATT ID.",
+                }
+            },
+        },
+    },
+    {
+        "name": "omnipong_player_search",
+        "description": "Look up a player's official USATT rating and USATT ID on OmniPong. USE ONLY IF search_players FAILS.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "player_name": {
+                    "type": "string",
+                    "description": "The name of the player to search for (e.g., 'Dawson, Jerry').",
+                }
+            },
+            "required": ["player_name"],
+        },
+    },
+    {
+        "name": "omnipong_league_sync",
+        "description": "Sync official USATT ratings and USATT IDs for all players in our league using OmniPong. This updates the local database with official data.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_practice_partners",
+        "description": "Analyze match history to recommend the best practice partners based on skill level, competitiveness, and areas for improvement. Returns ranked list of opponents to focus practice time on.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of recommendations to return (default: 5)",
+                }
+            },
+        },
+    },
+    {
+        "name": "get_tournament_intelligence",
+        "description": "Get AI-enhanced tournament recommendations with insights about difficulty, which events to enter, known players attending, and doubles partner suggestions. Analyzes tournament competition level and provides personalized guidance.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "tournament_title": {
+                    "type": "string",
+                    "description": "Optional: Filter by specific tournament name",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of tournaments to analyze (default: 5)",
+                },
+            },
+        },
+    },
+]
+
+
+async def get_claude_response(user_message: str, user_key: str | None = None):
+    """
+    Reusable logic to get a response from Claude 4 with tools.
+    Used by /chat endpoint AND SMS webhook.
+    user_key: caller's own Anthropic key (BYOK); if absent falls back to server key.
+    """
+    # Resolve the effective key: BYOK header wins, then OpenRouter, then Anthropic.
+    key = user_key or os.getenv("OPENROUTER_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
+    if not key:
+        raise ValueError("No AI key: set OPENROUTER_API_KEY / ANTHROPIC_API_KEY or send X-User-Api-Key")
+
+    if key.startswith("sk-or-"):
+        # OpenRouter key → OpenRouter's Anthropic-compatible Messages endpoint
+        # (verified: POST https://openrouter.ai/api/v1/messages returns 200).
+        client = anthropic.Anthropic(api_key=key, base_url="https://openrouter.ai/api")
+        model = "anthropic/claude-sonnet-4.5"
+    else:
+        client = anthropic.Anthropic(api_key=key)
+        model = "claude-sonnet-4-5"
+
+    messages = [{"role": "user", "content": user_message}]
+
+    try:
+        # Initial call to Claude
+        response = client.messages.create(
+            model=model,
+            max_tokens=1024,
+            system=SYSTEM_PROMPT,
+            tools=CLAUDE_TOOLS,
+            messages=messages,
+        )
+
+        # Tool Handling Loop
+        while response.stop_reason == "tool_use":
+            tool_results = []
+
+            messages.append({"role": "assistant", "content": response.content})
+
+            for content_block in response.content:
+                if content_block.type == "tool_use":
+                    tool_name = content_block.name
+                    tool_input = content_block.input
+                    tool_id = content_block.id
+
+                    print(f"DEBUG: Claude calling tool {tool_name} with {tool_input}")
+
+                    # Tool Execution
+                    result = {}
+                    try:
+                        if tool_name == "get_context":
+                            result = get_agent_context()
+                        elif tool_name == "get_stats":
+                            result = get_stats(source=tool_input.get("source", "usatt"))
+                        elif tool_name == "query_matches":
+                            result = tool_query_matches(**tool_input)
+                        elif tool_name == "get_performance_analysis":
+                            result = get_tool_analysis()
+                        elif tool_name == "search_players":
+                            result = tool_search_players(PlayerSearch(**tool_input))
+                        elif tool_name == "omnipong_player_search":
+                            result = await browser_manager.search_omnipong_player(
+                                tool_input.get("player_name")
+                            )
+                        elif tool_name == "omnipong_league_sync":
+                            result = await tool_sync_league_players()
+                        elif tool_name == "get_practice_partners":
+                            result = get_practice_partners(
+                                limit=tool_input.get("limit", 5)
+                            )
+                        elif tool_name == "get_tournament_intelligence":
+                            result = get_tournament_intelligence(
+                                tournament_title=tool_input.get("tournament_title"),
+                                limit=tool_input.get("limit", 5),
+                            )
+                    except Exception as tool_err:
+                        result = {"error": str(tool_err)}
+
+                    tool_results.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "tool_result",
+                                    "tool_use_id": tool_id,
+                                    "content": json.dumps(result, default=str),
+                                }
+                            ],
+                        }
+                    )
+
+            # Send tool results back to Claude
+            messages.extend(tool_results)
+            response = client.messages.create(
+                model=model,
+                max_tokens=1024,
+                system=SYSTEM_PROMPT,
+                tools=CLAUDE_TOOLS,
+                messages=messages,
+            )
+
+        # Get the final text response
+        final_text = ""
+        for block in response.content:
+            if block.type == "text":
+                final_text += block.text
+
+        return final_text
+
+    except Exception as e:
+        print(f"Chat API Error: {e}")
+        # FAIL LOUDLY as requested. Do not return friendly fallback.
+        raise HTTPException(status_code=503, detail=f"AI Service Error: {e!s}")
+
+
+@app.post("/chat")
+async def chat_endpoint(msg: ChatMessage, request: Request, _: None = Depends(_require_api_key)):
+    response_text = await get_claude_response(msg.message, user_key=_get_user_ai_key(request))
+    return {"response": response_text}
+
+
+class PracticeReminder(BaseModel):
+    partner_name: str
+    reason: str = None
+
+
+@app.post("/tools/remind_practice_partner")
+def remind_practice_partner(reminder: PracticeReminder):
+    """
+    Send an SMS reminder to the user to practice with a specific partner.
+    """
+    session = SessionLocal()
+    try:
+        # 1. Get User Phone Number
+        # Try DB first
+        user = session.execute(text("SELECT * FROM users LIMIT 1")).fetchone()
+        target_phone = None
+
+        if user:
+            # Check if phone col exists (it might not if migration failed/didn't run yet)
+            # Safe access via dictionary
+            u_dict = dict(user._mapping)
+            target_phone = u_dict.get("phone_number")
+
+        # Fallback to Env
+        if not target_phone:
+            target_phone = os.getenv("USER_PHONE_NUMBER")
+
+        if not target_phone:
+            return {
+                "status": "error",
+                "message": "No user phone number found. Please set USER_PHONE_NUMBER in .env or update settings.",
+            }
+
+        # 2. Construct Message
+        msg_body = f"🏓 Coach Rubberr Reminder: You should practice with {reminder.partner_name}!"
+        if reminder.reason:
+            msg_body += f"\n\nContext: {reminder.reason}"
+
+        # 3. Send SMS via Twilio
+        account_sid = os.environ.get("TWILIO_ACCOUNT_SID")
+        auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
+        api_key = os.environ.get("TWILIO_API_KEY_SID")
+        api_secret = os.environ.get("TWILIO_API_KEY_SECRET")
+        from_phone = os.environ.get("TWILIO_PHONE_NUMBER")
+
+        if not from_phone:
+            return {"status": "error", "message": "Twilio phone number missing"}
+
+        from twilio.rest import Client
+
+        if api_key and api_secret and account_sid:
+            client = Client(api_key, api_secret, account_sid)
+        elif auth_token and account_sid:
+            client = Client(account_sid, auth_token)
+        else:
+            return {"status": "error", "message": "Twilio credentials missing"}
+
+        message = client.messages.create(
+            body=msg_body, from_=from_phone, to=target_phone
+        )
+
+        return {
+            "status": "success",
+            "sid": message.sid,
+            "message": f"Reminder sent to {target_phone}",
+        }
+
+    except Exception as e:
+        print(f"Reminder Error: {e}")
+        return {"status": "error", "message": str(e)}
+    finally:
+        session.close()
+
+
+class PhoneUpdate(BaseModel):
+    phone_number: str
+
+
+@app.post("/settings/update_phone")
+def update_phone(data: PhoneUpdate):
+    """Update the user's phone number in the database."""
+    session = SessionLocal()
+    try:
+        # Check if user exists
+        user_check = session.execute(text("SELECT id FROM users LIMIT 1")).fetchone()
+
+        if user_check:
+            # Update
+            session.execute(
+                text("UPDATE users SET phone_number = :p"), {"p": data.phone_number}
+            )
+        else:
+            # Create dummy user if needed? Should exist.
+            # Assuming the primary user exists from migration.
+            pass
+
+        session.commit()
+        return {"status": "success", "message": "Phone number updated"}
+    except Exception as e:
+        # If column doesn't exist, this might fail.
+        # We might need to alter table here if we really want to be robust, but strict schema usually managed outside.
+        # Let's try to catch "no such column" and auto-migrate?
+        if "no such column" in str(e).lower():
+            try:
+                session.rollback()
+                session.execute(text("ALTER TABLE users ADD COLUMN phone_number TEXT"))
+                session.commit()
+                # Retry update
+                session.execute(
+                    text("UPDATE users SET phone_number = :p"), {"p": data.phone_number}
+                )
+                session.commit()
+                return {
+                    "status": "success",
+                    "message": "Phone number updated (column created)",
+                }
+            except Exception as migrate_err:
+                return {
+                    "status": "error",
+                    "message": f"Migration failed: {migrate_err}",
+                }
+
+        return {"status": "error", "message": str(e)}
+    finally:
+        session.close()
+
+
+class PlayerSettings(BaseModel):
+    name: str
+    rating: float | None = None
+    usatt_id: str | None = None
+
+
+@app.post("/settings/player")
+def update_player(data: PlayerSettings):
+    """Set the player identity (name, optional rating/usatt id).
+
+    Used by the agent, the map, and the ranking recommendations so the app
+    knows who it is scouting for."""
+    session = SessionLocal()
+    try:
+        user_row = session.execute(text("SELECT id FROM users LIMIT 1")).fetchone()
+        if not user_row:
+            return {"status": "error", "message": "No user record to update."}
+
+        fields: dict = {"name": data.name}
+        if data.rating is not None:
+            fields["current_rating"] = data.rating
+            fields["official_rating"] = data.rating
+        if data.usatt_id is not None:
+            fields["usatt_id"] = data.usatt_id
+
+        def _apply(values: dict) -> None:
+            sets = ", ".join(f"{col} = :{col}" for col in values)
+            session.execute(
+                text(f"UPDATE users SET {sets} WHERE id = :uid"),
+                {**values, "uid": user_row[0]},
+            )
+
+        try:
+            _apply(fields)
+            session.commit()
+        except Exception as e:
+            # Auto-create any missing columns, then retry (mirrors
+            # /settings/update_phone).
+            if "no such column" not in str(e).lower():
+                raise
+            session.rollback()
+            for col, coltype in (
+                ("name", "TEXT"),
+                ("current_rating", "REAL"),
+                ("official_rating", "REAL"),
+                ("usatt_id", "TEXT"),
+            ):
+                try:
+                    session.execute(text(f"ALTER TABLE users ADD COLUMN {col} {coltype}"))
+                    session.commit()
+                except Exception:
+                    session.rollback()
+            _apply(fields)
+            session.commit()
+
+        return {
+            "status": "success",
+            "message": "Player updated",
+            "player": {
+                "name": data.name,
+                "rating": data.rating,
+                "usatt_id": data.usatt_id,
+            },
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+    finally:
+        session.close()
+
+
+@app.post("/tools/sync/account")
+async def sync_account(_: None = Depends(_require_api_key)):
+    """Read the member's OmniPong account generically and store the account number.
+
+    The scraper returns raw text plus structure-derived fields, panels and
+    history rows, so this endpoint does not depend on the site's exact
+    wording. It persists the account number (the real USATT number) and
+    returns the whole generic payload for the client to display. OmniPong
+    does not publish the member's rating, so the rating is left to the
+    results/relay paths rather than guessed here."""
+    try:
+        from omnipong_scraper import OmniPongScraper
+
+        scraper = OmniPongScraper(browser_manager)
+        account = await scraper.scrape_my_account()
+        acct_no = account.get("account_number")
+        rows = account.get("rows") or []
+        finished_count = sum(1 for r in rows if r.get("has_date"))
+
+        if acct_no:
+            session = SessionLocal()
+            try:
+                session.execute(
+                    text(
+                        "UPDATE users SET usatt_id = :v "
+                        "WHERE id = (SELECT id FROM users LIMIT 1)"
+                    ),
+                    {"v": acct_no},
+                )
+                session.commit()
+            except Exception:
+                session.rollback()
+            finally:
+                session.close()
+
+        return {
+            "status": "success",
+            "account_number": acct_no,
+            "finished_count": finished_count,
+            "account": account,
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+class UsattSyncRequest(BaseModel):
+    name: str | None = None
+
+
+@app.post("/tools/sync/usatt")
+async def sync_usatt(
+    request: Request,
+    data: UsattSyncRequest | None = None,
+    _: None = Depends(_require_api_key),
+):
+    """Retrieve the player's official USATT rating through the relay and store it.
+
+    Reuses the same relay/browser path as GET /tools/lookup/usatt (USATT is
+    Cloudflare-walled, so it must go through a real browser). The retrieved
+    rating is written to users.official_rating/current_rating and the rating
+    history is mirrored into rating_history (source='usatt'). If the relay or
+    its operator token is not configured, this returns a clean error instead
+    of guessing a number."""
+    session = SessionLocal()
+    try:
+        row = session.execute(text("SELECT id, name FROM users LIMIT 1")).fetchone()
+        if not row:
+            return {"status": "error", "message": "No user record to update."}
+        uid = row._mapping["id"]
+        name = (data.name if data and data.name else None) or row._mapping["name"]
+        name = name or os.getenv("PLAYER_FULL_NAME") or os.getenv("PLAYER_NAME")
+        if not name:
+            return {"status": "error", "message": "No player name set to look up."}
+    finally:
+        session.close()
+
+    try:
+        profile = await tool_lookup_usatt(name=name, request=request)
+    except HTTPException as e:
+        return {"status": "error", "message": str(e.detail)}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+    if profile.get("status") != "success":
+        return {"status": "error", "message": profile.get("message") or "USATT lookup failed."}
+
+    player = profile.get("player") or {}
+    rating = player.get("rating")
+    usatt_id = player.get("usatt_id")
+    history = profile.get("rating_history") or []
+
+    stored_history = 0
+    session = SessionLocal()
+    try:
+        fields: list[str] = []
+        params: dict = {"uid": uid}
+        if isinstance(rating, (int, float)):
+            fields += ["official_rating = :r", "current_rating = :r"]
+            params["r"] = float(rating)
+        if usatt_id:
+            fields += ["usatt_id = :u"]
+            params["u"] = str(usatt_id)
+        if fields:
+            session.execute(
+                text(f"UPDATE users SET {', '.join(fields)} WHERE id = :uid"), params
+            )
+        if history:
+            session.execute(text("DELETE FROM rating_history WHERE source = 'usatt'"))
+            for h in history:
+                if not isinstance(h, dict):
+                    continue
+                when, value = h.get("date"), h.get("rating")
+                if when and isinstance(value, (int, float)):
+                    session.execute(
+                        text(
+                            "INSERT INTO rating_history (date, rating, source, notes) "
+                            "VALUES (:d, :r, 'usatt', 'USATT lookup')"
+                        ),
+                        {"d": when, "r": float(value)},
+                    )
+                    stored_history += 1
+        session.commit()
+    except Exception as e:
+        session.rollback()
+        return {"status": "error", "message": f"USATT fetched but not saved: {e}"}
+    finally:
+        session.close()
+
+    return {
+        "status": "success",
+        "message": f"USATT rating {rating} for {player.get('name') or name}.",
+        "player": player,
+        "rating_history_count": stored_history,
+    }
+
+
+@app.get("/players/{player_name}/scouting")
+async def get_player_scouting(player_name: str, _: None = Depends(_require_api_key)):
+    """
+    Generate an AI scouting report for a specific opponent based on match history.
+    """
+    session = SessionLocal()
+    try:
+        # 1. Fetch all matches against this opponent
+        query = text("""
+            SELECT date, winner_name, loser_name, result, score_summary, set_scores, source 
+            FROM matches 
+            WHERE opponent_name = :name
+            ORDER BY date DESC
+        """)
+        result = session.execute(query, {"name": player_name})
+        matches = [dict(row._mapping) for row in result]
+
+        if not matches:
+            return {
+                "status": "error",
+                "message": f"No match history found for {player_name}",
+            }
+
+        # 2. Extract basic stats
+        wins = sum(
+            1
+            for m in matches
+            if m["winner_name"] == PLAYER_FULL_NAME
+            or m["result"] == "Win"
+            or m["result"] == "W"
+        )
+        losses = len(matches) - wins
+
+        # 3. Request AI Analysis
+        match_summary = "\n".join(
+            [
+                f"- {m['date']}: {m['result']} ({m['score_summary']}) Sets: {m['set_scores']}"
+                for m in matches
+            ]
+        )
+
+        prompt = f"""
+        You are a Table Tennis Scout. Analyze the following match history for '{PLAYER_FULL_NAME}' against '{player_name}'.
+
+        MATCH HISTORY:
+        {match_summary}
+
+        TASK:
+        1. Identify the opponent's likely style based on the results and scores (e.g., blocker, attacker, chopper).
+        2. Highlight the player's vulnerabilities in these matches (e.g., "loses long rallies", "struggles in deciding sets").
+        3. Provide 3 specific tactical "Keys to Victory" for the next match.
+        4. Keep it concise, strategic, and professional.
+        """
+
+        scouting_report = await get_claude_response(prompt)
+
+        return {
+            "player_name": player_name,
+            "stats": {
+                "total_matches": len(matches),
+                "record": f"{wins}-{losses}",
+                "win_rate": f"{round(wins / len(matches) * 100)}%" if matches else "0%",
+            },
+            "analysis": scouting_report,
+        }
+
+    except Exception as e:
+        print(f"Scouting Error: {e}")
+        return {"status": "error", "message": str(e)}
+    finally:
+        session.close()
+
+
+@app.get("/training/recommendations")
+async def get_training_recommendations(request: Request):
+    """
+    Analyze global match history to suggest training focus areas and drills.
+    """
+    session = SessionLocal()
+    try:
+        # 1. Fetch stats for all matches
+        # We'll use a simplified version of the logic inside /stats
+        query = text("SELECT result, set_scores FROM matches")
+        matches = session.execute(query).fetchall()
+
+        total = len(matches)
+        if total == 0:
+            return {
+                "status": "error",
+                "message": "No match data available for analysis.",
+            }
+
+        comebacks = 0
+        chokes = 0
+        close_sets_won = 0
+        close_sets_swung = 0
+
+        for m in matches:
+            res_str = m[0]
+            sets_str = m[1]
+            is_win = (
+                res_str == "Win"
+                or res_str == "W"
+                or (
+                    res_str
+                    and "-" in res_str
+                    and int(res_str.split("-")[0]) > int(res_str.split("-")[1])
+                )
+            )
+
+            if sets_str:
+                try:
+                    set_list = [s.strip() for s in sets_str.split(",")]
+                    parsed_sets = []
+                    for s in set_list:
+                        if "-" in s:
+                            sp1, sp2 = map(int, s.split("-"))
+                            parsed_sets.append((sp1, sp2))
+                            if abs(sp1 - sp2) <= 2:
+                                close_sets_swung += 1
+                                if sp1 > sp2:
+                                    close_sets_won += 1
+
+                    if len(parsed_sets) > 0:
+                        s1_user, s1_opp = parsed_sets[0]
+                        won_first_set = s1_user > s1_opp
+                        if not won_first_set and is_win:
+                            comebacks += 1
+                        elif won_first_set and not is_win:
+                            chokes += 1
+                except Exception:
+                    pass
+
+        # 2. Construct prompt for training advice
+        prompt = f"""
+        You are Coach Rubberr, a world-class table tennis coach.
+        Analyze the player's recent performance patterns across {total} matches and suggest a training plan.
+        
+        PATTERNS:
+        - Comebacks (Won after losing Set 1): {comebacks}
+        - Chokes (Lost after winning Set 1): {chokes}
+        - Close Set Win Rate (sets decided by 2 pts): {round(close_sets_won / close_sets_swung * 100) if close_sets_swung > 0 else 0}%
+        
+        TASK:
+        1. Identify the #1 psychological or physical weakness (e.g., "Pressure handling", "Slow starts").
+        2. Recommend 2 specific drills (provide drill names and brief descriptions) to address these.
+        3. Provide a motivational "Coach's Note."
+        4. Keep it short, authoritative, and impactful.
+        """
+
+        advice = await get_claude_response(prompt, user_key=_get_user_ai_key(request))
+
+        return {
+            "total_matches": total,
+            "patterns": {
+                "comebacks": comebacks,
+                "chokes": chokes,
+                "clutch_percent": round(close_sets_won / close_sets_swung * 100)
+                if close_sets_swung > 0
+                else 0,
+            },
+            "coach_advice": advice,
+        }
+
+    except Exception as e:
+        print(f"Training Error: {e}")
+        return {"status": "error", "message": str(e)}
+    finally:
+        session.close()
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=8000)

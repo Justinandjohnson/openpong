@@ -1,14 +1,16 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { intelligenceKeyRequiredMessage, required } from "../config.ts";
+import { required } from "../config.ts";
 import { createStore } from "../db.ts";
 import { createDemoModel, demoModel } from "./model.ts";
 
 const root = fileURLToPath(new URL("../../../../", import.meta.url));
-const intelligenceApiKey = required("CPK_INTELLIGENCE_API_KEY", intelligenceKeyRequiredMessage);
+// Rich Threads are optional in the demo too: pass the key through when the
+// operator has one, otherwise record native chat without thread replay.
+const intelligenceApiKey = process.env.CPK_INTELLIGENCE_API_KEY?.trim() || undefined;
 const jevMode = process.env.DEMO_JEV_MODE ?? "sample";
 if (jevMode !== "sample" && jevMode !== "live")
   throw new Error("DEMO_JEV_MODE must be sample or live");
@@ -39,6 +41,17 @@ try {
     id: createHash("sha256").update(sessionToken).digest("hex"),
     owner: "local-user",
     expiresAt: Date.now() + 24 * 60 * 60 * 1000,
+  });
+  // The demo workspace is the one place the example profile (a data file, not a
+  // code literal) is applied, and only to this demo owner. A real first run
+  // starts with no profile at all and shows the guided setup instead.
+  const fixture = JSON.parse(
+    await readFile(new URL("../onboarding/example-profile.json", import.meta.url), "utf8"),
+  ) as { profile: Record<string, unknown> };
+  await db.put("local-user", "agent-settings", {
+    id: "profile",
+    ...fixture.profile,
+    updatedAt: new Date().toISOString(),
   });
 } finally {
   await db.close();
@@ -96,7 +109,7 @@ const api = spawn(
         process.env.DEMO_ALLOWED_ORIGINS ?? "http://localhost:8081,http://127.0.0.1:8081",
       DO_NOT_TRACK: "1",
       COPILOTKIT_TELEMETRY_DISABLED: "true",
-      CPK_INTELLIGENCE_API_KEY: intelligenceApiKey,
+      ...(intelligenceApiKey ? { CPK_INTELLIGENCE_API_KEY: intelligenceApiKey } : {}),
     },
   },
 );

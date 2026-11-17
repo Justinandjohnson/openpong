@@ -1,0 +1,169 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+:root {
+  --radius: 0.85rem;
+
+  /* OpenPong palette: night table, coral paddle, lime ball. */
+  --background: #070b0d;
+  --foreground: #eef4f2;
+  --card: #101619;
+  --card-foreground: #eef4f2;
+  --popover: #0d1316;
+  --popover-foreground: #eef4f2;
+  --primary: #ff5a3c;
+  --primary-foreground: #ffffff;
+  --secondary: #1a2327;
+  --secondary-foreground: #dfe9e5;
+  --muted: #151d21;
+  --muted-foreground: #8ba0a6;
+  --accent: #c9ff4d;
+  --accent-foreground: #101505;
+  --destructive: #f05252;
+  --destructive-foreground: #ffffff;
+  --border: #223036;
+  --input: #1a2529;
+  --ring: #c9ff4d;
+  --sidebar: #05080a;
+  --sidebar-foreground: #cddad7;
+  --chart-1: #c9ff4d;
+  --chart-2: #ff5a3c;
+  --chart-3: #4fd1c5;
+  --chart-4: #f7b955;
+  --chart-5: #8b9cff;
+
+  /* Legacy aliases kept so the merged Rubberr components keep their classes. */
+  --rubber-red: var(--primary);
+  --rubber-dark: #d94126;
+  --rubber-accent: var(--accent);
+  --card-background: var(--card);
+  --muted-foreground-legacy: var(--muted-foreground);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 10px);
+
+  --font-sans: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, monospace;
+}
+
+* {
+  border-color: var(--border);
+}
+
+html {
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(1200px 600px at 82% -10%, rgba(201, 255, 77, 0.07), transparent 60%),
+    radial-gradient(900px 500px at 8% 0%, rgba(255, 90, 60, 0.09), transparent 55%),
+    var(--background);
+  color: var(--foreground);
+  font-family: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: rgba(201, 255, 77, 0.28);
+}
+
+.text-balance {
+  text-wrap: balance;
+}
+
+.pong-grid {
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+  background-size: 44px 44px;
+}
+
+.pong-ball {
+  background: radial-gradient(circle at 32% 28%, #f2ffc4, var(--accent) 58%, #86b32a);
+  box-shadow: 0 0 24px rgba(201, 255, 77, 0.45);
+}
+
+@keyframes pong-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: scale(0.96);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.04);
+  }
+}
+
+.animate-pong-pulse {
+  animation: pong-pulse 2.6s ease-in-out infinite;
+}
+
+/* CopilotKit chrome, rebranded to the dashboard palette. */
+:root {
+  --copilot-kit-primary-color: var(--primary);
+  --copilot-kit-contrast-color: var(--primary-foreground);
+  --copilot-kit-background-color: var(--card);
+  --copilot-kit-secondary-color: var(--muted);
+  --copilot-kit-secondary-contrast-color: var(--foreground);
+  --copilot-kit-separator-color: var(--border);
+  --copilot-kit-muted-color: var(--muted-foreground);
+}
+
+.copilotKitPopup,
+.copilotKitSidebar,
+.copilotKitChat {
+  font-family: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+}
+
+.copilotKitChat .copilotKitMessages {
+  background: var(--background);
+}
+
+/* Keep the floating coach launcher clear of the dashboard's bottom status strip. */
+@media (min-width: 768px) {
+  .copilotKitPopup {
+    bottom: 4.25rem;
+  }
+}
+
+/* Leaflet dark friendly fallbacks. */
+.leaflet-container {
+  background: #0b1114;
+  font-family: var(--font-geist-sans), ui-sans-serif, system-ui, sans-serif;
+}

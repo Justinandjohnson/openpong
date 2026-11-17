@@ -1,0 +1,11 @@
+{
+  "$note": "EXAMPLE DATA ONLY. This is the first user's real profile from the build plan (docs/OPENPONG_BUILD_PLAN.md section 3), kept in a data file so no name, USATT number, region, city, club or league URL is a literal in code, a prompt or a default. Nothing auto-applies this to a new owner: a real first run starts with no profile and shows onboarding. The demo runner (apps/server/src/demo/entry.ts) applies it to the demo workspace only. Substitute your own values at onboarding or in Settings.",
+  "profile": {
+    "displayName": "Justin Johnson",
+    "usattId": "1184417",
+    "homeRegion": "8",
+    "cities": ["Plano", "Austin", "San Antonio"],
+    "states": ["Texas"],
+    "clubs": ["Top Spin USA"]
+  }
+}

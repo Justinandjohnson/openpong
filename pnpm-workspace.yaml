@@ -1,9 +1,11 @@
 packages:
   - apps/mobile
   - apps/worker
+  - apps/web
 allowBuilds:
   esbuild: true
   '@biomejs/biome': true
+  sharp: true
   '@scarf/scarf': false
   '@google/genai': false
   protobufjs: false

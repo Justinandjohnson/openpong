@@ -1,0 +1,26 @@
+# Root build context ignores. Only used by images built from the repo root
+# (Dockerfile.backend, Dockerfile.frontend). apps/worker and apps/computer build
+# from their own subdirectories with their own .dockerignore, so they are
+# unaffected.
+node_modules/
+**/node_modules/
+.git/
+.github/
+.openmuse/
+.demo/
+artifacts/
+dist/
+**/dist/
+.next/
+**/.next/
+*.tsbuildinfo
+**/*.tsbuildinfo
+apps/mobile/ios/
+apps/mobile/android/
+# The Python domain service has its own image; keep it out of Node contexts.
+services/omnipong/.venv/
+services/omnipong/__pycache__/
+services/omnipong/playwright_data/
+services/omnipong/playwright_sync_data/
+services/omnipong/*.db
+services/omnipong/.credentials.json

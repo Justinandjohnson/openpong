@@ -1,256 +1,211 @@
-  <div align="center">
+<div align="center">
 
-# OpenMuse
+# OpenPong
 
-**A personal agent with a browser, terminal, files, and work that keeps going. Compatible with any agent harness.**
+**An open, agent-first table tennis manager — keep track of everything, and let it manage everything for you.**
 
-Ask for an outcome. Follow the plan, review actions, and come back to the result.
-Built with CopilotKit React Native for iOS, Android, and web.
-
-[Quick start](#quick-start) · [Demo](#demo) · [Features](#features) · [Architecture](#architecture) · [Docs](docs/README.md) · [Contributing](CONTRIBUTING.md)
-
-[![CI](https://github.com/CopilotKit/OpenMuse/actions/workflows/ci.yml/badge.svg)](https://github.com/CopilotKit/OpenMuse/actions/workflows/ci.yml)
-[![MIT license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-
-<a href="https://trendshift.io/repositories/254992?utm_source=trendshift-badge&amp;utm_medium=badge&amp;utm_campaign=badge-trendshift-254992" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/trendshift/repositories/254992/daily?language=TypeScript" alt="CopilotKit%2Fopenmuse | Trendshift" width="250" height="55"/></a>
-
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/CopilotKit/OpenMuse)
-
-Clone this template and customize it however you want.
-
-**[Building on OpenMuse? Meet with the CopilotKit team →](https://www.copilotkit.ai/talk-to-an-engineer?ref=openmuse_hero)**
-
-https://github.com/user-attachments/assets/8014d185-346c-4954-8ff0-26c582c5093a
-
-https://github.com/user-attachments/assets/0cc87de0-c3c1-4f24-b7df-e7d04bb946fd
+Ratings, matches, tournaments and coaching in one place, with an agent that does the work:
+it reads your area's tournament calendar, syncs your league results, prepares a signup, and
+keeps watching while you play.
 
 </div>
 
-> **Alpha, for self-hosting and building on.** Open-ended reasoning, live Google accounts, and CopilotKit Rich Threads require their own configuration. See [what is verified](docs/VERIFICATION.md) and the [roadmap](ROADMAP.md).
+Built by fusing two open projects:
 
-## Demo
+- **[OpenMuse](https://github.com/CopilotKit/openmuse)** (MIT) — the agent harness: CopilotKit runtime, durable task engine with leases and approvals, Playwright browser worker, and the native app.
+- **[OmniPong](https://github.com/Justinandjohnson/omnipong)** (Apache-2.0) — the table tennis domain: USATT ratings, area tournament discovery, league match history, event matching and signups.
 
-On iPhone, ask OpenMuse to find interesting stories on Hacker News and summarize CopilotKit. On desktop, ask it to check the school-trip email, open the message, and research exhibits at Monterey Bay Aquarium. The agent shows email and browser results inline. **Take control** opens that same browser session when you need it.
+Both stay open source here. OpenPong itself is Apache-2.0 with the upstream MIT notices preserved.
 
-The 38-second iPhone and 42-second desktop web demos show the current interface, framed in 16:9. The send arrow becomes a stop square inside the input pill while the agent replies, then switches back. Stopping keeps your draft intact. See the [recording notes](docs/DEMO.md) for the model setup and reproduction steps.
-
-[Mobile MP4](https://github.com/user-attachments/assets/8014d185-346c-4954-8ff0-26c582c5093a) · [Web MP4](https://github.com/user-attachments/assets/0cc87de0-c3c1-4f24-b7df-e7d04bb946fd) · [Recording details and reproduction](docs/DEMO.md)
-
-The [Jev aquarium-trip demo](docs/demos/jev-generative-ui.md) walks through a fictional school email, clarification choices, sourced exhibit cards, hands-on preference refinement, and a confirmed selection. [Watch the 83-second live Jev recording](assets/demos/2026-09-23/jev-live-web.mp4), where TypeSafe Jev makes the decisions and a scripted agent keeps the trip scenario repeatable. A [scripted-decision sample recording](assets/demos/2026-09-23/jev-web.mp4) is also available.
+---
 
 ## What it is
 
-OpenMuse is a personal-agent application with an agent computer, visible work, and rich results. It runs its own server, task worker, and browser worker. You can inspect and change the source under the MIT license.
+Three surfaces, one runtime:
 
-The computer combines **persistent Chromium and an optional Linux workspace**. The agent can browse public pages, run commands in its own container, work with files, and move PDFs between the computer and the app. You can open its browser or terminal and continue the work. Graphical desktops and autonomous checkout remain future work.
-
-## Features
-
-| Surface | What runs in this alpha |
+| Surface | What it is |
 | --- | --- |
-| **Chat** | CopilotKit headless chat with streamed AG-UI events, mailbox search and reading, send/stop in one input pill, a visible follow-up queue, retained drafts, delegated tasks, and inline email, browser, PDF, plan, and finance cards. |
-| **Agent computer** | Persistent browser profiles and takeover console; optional isolated Linux terminal, saved command receipts, editable workspace files, and PDF transfer. |
-| **Activity** | Durable task plans, progress, input requests, pause/resume/cancel/retry, approvals, and saved receipts. SQL leases recover interrupted work. |
-| **Ideas** | Suggestions with source evidence; edit, accept, or dismiss. Sent replies and completed matching work are excluded. |
-| **Goals & Tracking** | Goals and milestones; recurring public-page checks for changes, text availability, or USD price thresholds, with deduplicated alerts and failure backoff. |
-| **Documents** | Email attachment → PDF → requested form values → filled copy → reviewed reply → receipt. Native/web PDF viewing, paging, zoom, supported fields, and sharing. |
-| **Finance** | Import transaction CSV to create a spending summary with categories, transactions, and a savings-goal action. |
-| **Gmail & Calendar** | Google OAuth adapters, complete mail threads, drafts/attachments, calendar discovery, and reviewed event creation/update/deletion. Live credentials required. |
-| **Personal context** | Editable name, tone, avatar, and memories. Background-update preferences and durable in-app notifications. |
-| **Rich Threads** | CopilotKit Intelligence persistence in every mode, with a stable main conversation, side chats, renaming, archiving, restoring, and replay. A server-only project key is required. |
+| **Dashboard** (`apps/web`) | Next.js + Tailwind + shadcn-style UI. Tournaments, matches, analytics, player lookup, profile/settings, and a coach panel on every screen. Installable as a PWA on a phone or tablet. |
+| **Coach** (built-in chat) | The same thread and the same tools as the dashboard and the native app. Ask in plain language; long work becomes a durable task you can watch, pause, and approve. |
+| **Native app** (`apps/mobile`) | Expo / React Native for iOS and Android. Same server, same threads, same workspace. |
 
-The [feature inventory](docs/FEATURES.md) describes implemented capabilities and planned extensions. Health/bank/social connectors, device push, voice, generated executable tools, and automatic reservations/payments are on the [roadmap](ROADMAP.md).
+Everything the agent knows about you comes from **your profile**: name, USATT number, home
+region, cities, states, clubs, and the league pages you follow. Nothing is hard-coded — the
+same download works for someone in Ohio as it does for the first user in Texas.
+
+### What the agent can do
+
+| Capability | Tool | Notes |
+| --- | --- | --- |
+| Your identity and rating | `get_my_profile` | Reads your saved profile plus the live rating from the domain service. |
+| Anyone's rating | `search_player`, `get_player_profile` | Public USATT lookups; no login. |
+| Tournaments near you | `list_tournaments` | Filtered to your saved area. `deep: true` scrapes each event's divisions and fees. |
+| Your match history | `list_my_matches`, `get_analytics` | League, USATT and arcade results together; win rate, rating trend, patterns. |
+| League sync | `sync_league` | Scrapes your public league pages (Stadium TT) into your history. No credentials. |
+| Full data sync | `sync_data` | Durable task: tournaments, leagues, camps, events, details. |
+| Tournament signup | `signup_tournament` | **Dry run by default.** A real registration needs `OMNIPONG_ALLOW_REAL_SIGNUP=true` *and* an explicit approval in the app. |
+| Watch a tournament | `watch_tournament` | Recurring check with deduplicated alerts. |
+| Log a match | `record_match` | Writes an arcade/club result to your ledger; re-posting the same match is a no-op. |
+| Daily scout | scout task | Once a day it diffs your area's tournaments and pings you only for new ones. |
+| Calendar hub | `sync_pong_calendar`, `add_pong_event`, `list_pong_events` | Writes your tournaments, approved registrations and results into one **Pong** calendar. Google gets a real secondary calendar via OAuth; Apple and Outlook subscribe to a private iCal feed. The agent can only touch Pong. |
+
+### Trust model
+
+- **No third-party credentials are stored.** League data comes from public pages. Anything that needs your login (registration, private history) runs through your own browser via the relay + companion: the user logs in themselves and a human gate handles any login/2FA. With `OMNIPONG_BROWSER=relay`, no credential file is read at all — the legacy stored-credential path is opt-in only (`OMNIPONG_ALLOW_STORED_CREDENTIALS=true`). See `docs/RELAY_ARCHITECTURE.md`.
+- **Signups are never silent.** The tool previews, the task waits for approval, and the receipt is saved.
+- **Read tools are read-only.** Chat cannot change your record through a query tool.
+- **Your bearer stays server-side.** The dashboard's BFF mints the session; the browser only holds an httpOnly cookie.
+- **Scraped text is data, not instructions.** The coach is told never to obey instructions found in a page.
+
+---
 
 ## Quick start
 
-**Requirements:** Node 24 LTS, pnpm 11.19.0, and a CopilotKit Intelligence project key. The local sample app needs no model, Google account, or Docker.
+**Requirements**
+
+- Node 22+ (24 LTS recommended) and pnpm 11.19.0
+- Python 3.13 for the OmniPong domain service
+- A CopilotKit Intelligence project key (`CPK_INTELLIGENCE_API_KEY`) — optional; without it chat
+  still works but threads are not persisted (`/api/health` reports `threadsConfigured: false`)
+- A model provider key (OpenAI, Anthropic, Google, or OpenRouter)
 
 ```sh
-git clone https://github.com/CopilotKit/OpenMuse.git openmuse
-cd openmuse
-pnpm install --frozen-lockfile
+git clone <your-fork-url> openpong
+cd openpong
+pnpm install
 cp .env.example .env
-npx copilotkit@latest login
-npx copilotkit@latest project select
-# Set CPK_INTELLIGENCE_API_KEY in .env to the generated server-only project key.
-# Keep the CLI-generated CPK_TELEMETRY_ID too, including in deployed server environments.
-pnpm dev
 ```
 
-In another terminal:
+Edit `.env` with at least:
 
 ```sh
-pnpm dev:web
+CPK_INTELLIGENCE_API_KEY=cpk-...
+AGENT_BACKEND=model
+MODEL=openai/google/gemini-2.5-flash        # or any provider/model your key supports
+OPENAI_API_KEY=sk-...                        # matching provider key
+OPENAI_BASE_URL=https://openrouter.ai/api/v1 # only for OpenRouter
+OPENAI_CHAT_COMPLETIONS=true                 # required for OpenRouter
 ```
 
-Open [localhost:8081](http://localhost:8081). The API runs at [localhost:8787/api/health](http://localhost:8787/api/health).
-
-### Try it
-
-1. In Chat, send **“Complete the permission slip”**. Open the task, supply fictional form values, inspect the saved PDF, and review the prepared reply. This writes only to the local mailbox.
-2. In **Goals → Track**, create a built-in availability watch, then change the built-in test page to trigger an alert.
-3. In **Menu → Delegate task → Finance**, use **Try example transactions** to create an interactive spending tracker.
-4. Start the [browser worker](#browser-worker) and configure a model, then ask **“Check out Hacker News for cool stuff”** or **“Summarize copilotkit.ai”**. Follow the browser inline and use **Take control** to open its session. For a model-free version of this flow, follow the [AI Mock demo setup](docs/DEMO.md#run-the-agent-browser-demo).
-
-For iOS or Android, use `pnpm --dir apps/mobile ios` or `pnpm --dir apps/mobile android`. Xcode or Android tooling is required. The PDF reader needs an Expo development build; use [native setup](apps/mobile/README.md).
-
-## Deploy on Render
-
-[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/CopilotKit/OpenMuse)
-
-[render.yaml](render.yaml) deploys three services: the API, the web app, and a private browser. The API answers `/` with JSON, so the UI is its own static site.
-
-### First run
-
-1. Click **Deploy to Render**. Wait until `openmuse-api`, `openmuse-web`, and `openmuse-browser` are live.
-2. On `openmuse-api`, open **Environment** and copy `OPENMUSE_ACCESS_KEY`.
-3. Open the `openmuse-web` URL and sign in with that key.
-4. Send a message.
-
-The deploy form asks for three values you provide. Render generates the other two.
-
-| Variable | Set by | If it is missing |
-|---|---|---|
-| `CPK_INTELLIGENCE_API_KEY` | You. Run `npx copilotkit@latest login`, then `npx copilotkit@latest project select`. Keep it on the server. | Chat cannot open a thread. |
-| `CPK_TELEMETRY_ID` | You. Keep the identity generated by the same project selection. | Runtime usage cannot be attributed to the Intelligence signup account. |
-| `OPENAI_API_KEY` | You. Used by the default `openai/gpt-5`. Change `MODEL` and supply the matching provider key for Anthropic or Google. | The model call fails. |
-| `OPENMUSE_ACCESS_KEY` | Render | You cannot sign in. |
-| `TOKEN_ENCRYPTION_KEY` | Render | The API refuses to start in live mode. |
-
-Health check: `https://<openmuse-api>/api/health`.
-
-### Services
-
-| Service | Plan | What it runs |
-|---|---|---|
-| `openmuse-api` | Standard, with a 1 GB disk at `/var/data` | The Hono API and the in-process task worker. `DATA_DIR` is `/var/data/openmuse`. |
-| `openmuse-web` | Static site | The Expo web export. `EXPO_PUBLIC_API_URL` is baked in at build time. |
-| `openmuse-browser` | Private service, Standard, 1 GB disk at `/data` | Playwright and Chromium. The API calls it on the private network. |
-
-**Standard** is the smallest plan that stays up. At 512 MB the process runs out of memory before it binds a port, because PGlite loads an embedded Postgres build.
-
-**The disk** holds the database, PDFs, and the signing key. A redeploy without it wipes that data. Chat threads are stored by CopilotKit Intelligence, so a thread can still load after you sign back in even when the disk was never attached.
-
-**Live mode** is required. Render binds `0.0.0.0`, and sample mode rejects any host that is not loopback. The Blueprint sets `WORKSPACE_MODE=live`.
-
-**Browsing is included, and you can take it out.** `openmuse-browser` is a private service, so it has no public URL. The API reaches it at `http://openmuse-browser:8790` with a token Render generates. If the private hostname is not `openmuse-browser`, set `BROWSER_WORKER_URL` to `http://<that-host>:8790`. To deploy without it, delete the `openmuse-browser` service and the `BROWSER_WORKER_URL` and `WORKER_TOKEN` entries on `openmuse-api`. Chat, drafts, and tasks still run. Page reads, screenshots, and **Take control** do not.
-
-The Docker computer and Google mail or calendar need the setup in the sections below. This Blueprint does not start them.
-
-## Configure the agent and Google
-
-Copy the commented settings in [.env.example](.env.example) into your private `.env`:
-
-1. Set `AGENT_BACKEND=model`, `MODEL=provider/model-id`, and the matching provider key. CopilotKit supports the configured OpenAI, Anthropic or Google provider. Fictional data can still be used with a real model. Provider keys stay on the server.
-2. Create or select a CopilotKit Intelligence project with `npx copilotkit@latest login` and `npx copilotkit@latest project select`. Keep the generated `CPK_INTELLIGENCE_API_KEY` on the server.
-3. For personal mail/calendar, set `WORKSPACE_MODE=live`, the generated `CPK_INTELLIGENCE_API_KEY`, a random `OPENMUSE_ACCESS_KEY` of at least 24 characters, and `TOKEN_ENCRYPTION_KEY` containing 32 random bytes encoded as base64. Restart the API.
-4. Configure a Google OAuth web client with Gmail and Calendar APIs enabled. Set `GOOGLE_CLIENT_ID` and `GOOGLE_CLIENT_SECRET`; register `${PUBLIC_API_URL}/api/google/callback` as its redirect URI. Configure consent/test-user access in your Google project.
-5. Open **Apps → Gmail** (or **Google Calendar**), connect read access, and grant write access when needed. Every send or calendar change still requires its own stored review. Changing/disconnecting the account invalidates pending connection-bound work.
-
-Google credentials are encrypted at rest. File URLs and browser consoles use short-lived signatures. This deployment uses one owner protected by a shared access key; it is not a multi-tenant authentication system. Use HTTPS and restricted network access for a remote host. Keep the default local-data mode on loopback.
-
-## Public web search
-
-Web search is enabled by default. Set `WEB_SEARCH_ENABLED=false` on the API and any separate task worker to disable it. With a configured model, delegated tasks and built-in model chat (`AGENT_BACKEND=model`) use [Parallel's free, keyless Search MCP](https://docs.parallel.ai/integrations/mcp/search-mcp) as their built-in search provider. Ask, for example, “Find the official CopilotKit React Native setup instructions and cite the sources.” Results include source URLs and excerpts; delegated tasks save them as evidence. Scripted sample chat and external AG-UI conversations keep their existing tools.
-
-Search sends model-generated queries and context, which may include information from your conversation or task, plus a random per-chat/task session identifier to Parallel. See [Parallel's privacy policy](https://parallel.ai/privacy-policy). Free access is rate limited; failures are reported without a paid fallback. Stopping chat or interrupting a task cancels its search.
-
-## Browser worker
-
-Set `BROWSER_WORKER_URL=http://127.0.0.1:8790` and a random `WORKER_TOKEN` of at least 32 characters in `.env`.
+Then run three processes:
 
 ```sh
-pnpm --dir apps/worker exec playwright install chromium
-pnpm dev:browser
+# 1. The table tennis domain service (ratings, matches, tournaments)
+cd services/omnipong
+python3.13 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+# playwright install chromium   # needed for scraping and signups
+uvicorn backend.main:app --host 127.0.0.1 --port 8000
+
+# 2. The agent server
+pnpm dev            # http://localhost:8787/api/health
+
+# 3. The dashboard
+pnpm dev:dashboard  # http://localhost:3000
 ```
 
-Or use `docker compose --env-file .env -f infra/compose.yaml up --build -d`. The same token must reach the API and worker. Sessions have persistent Chromium profiles; the app can open a live screenshot console and import PDF downloads. Agent tools can read public pages and hand interactive work to the person. [Worker setup and boundaries](apps/worker/README.md).
+Optional: `pnpm dev:web` runs the native app as a web build on
+[localhost:8081](http://localhost:8081), and `pnpm --dir apps/mobile ios` opens it on a simulator.
 
-## Persistence and operation
+On first run the dashboard shows a **Set up my profile** banner. Fill in your name and area —
+that one record is what makes the tournament search and the coach yours.
 
-### Linux terminal and workspace
+---
 
-Build the computer image, enable it on the API, then open **Computer → Terminal → Start computer**:
+## Try it
 
-```sh
-docker build -t openmuse-computer:local apps/computer
-COMPUTER_ENABLED=true pnpm dev
-```
+1. **“What's my USATT rating, and how did my last match go?”** — answers from the domain service, with the most recent result and set scores.
+2. **“Find tournaments near me”** — filtered by your saved cities and states, not by a default region.
+3. **“Sync my league matches”** — needs a league URL in Settings; the task shows its progress and refuses politely if none is saved.
+4. **“Prepare a signup for <tournament>”** — returns a preview you can approve; nothing is registered unless real signups are enabled.
+5. Open **Matches** and **Analytics** for the same data as charts, and **Player lookup** for anyone else's rating.
+6. **Log a match** on `/matches/new` (or just tell the coach the score) — it lands in the ledger, the record ring and the form strip immediately.
+7. **Text your OpenPong number** `MATCHES`, `TOURNAMENTS`, `RATING`, `SYNC` or `HELP` — the webhook verifies Twilio's signature and answers by rule, never by model.
+8. **Save your mobile number** in Settings → *Text alerts*, then **Send a test text**. The daily scout texts you when a new tournament shows up in your area; if Twilio is not configured yet the card says so instead of pretending.
 
-The API needs access to the Docker CLI and engine. Commands run in a nonroot container with no host-directory mounts or credentials. A named `/workspace` volume retains files when stopped. Terminal networking is disabled; public web access uses the browser worker. Commands have a 30-second limit and saved output/exit receipts. **Files** supports folders, text editing, and PDF transfer to/from Documents. This is a Linux container, not a full operating-system VM. [Setup, Colima option, and boundaries](docs/COMPUTER.md).
-
-### Application storage
-
-By default, embedded PGlite, documents and the signing key live in `.openmuse/`; browser profiles live in `.openmuse/browser-profiles/`. Keep that directory private and back it up. The API hosts the task worker. The host must remain running for background work.
-
-For a separate task worker, configure the same `DATABASE_URL`, secrets and shared `DATA_DIR` for both processes, then set `TASK_WORKER_ENABLED=false` on the API and run `pnpm dev:worker`. PGlite cannot be opened by separate processes. Production commands are `pnpm build:server`, `pnpm start` and `pnpm start:worker`. Run one API instance; task workers coordinate through SQL leases.
-
-No hidden retry occurs after an uncertain external write. Review its provider outcome before creating a replacement. Pausing/cancelling prevents subsequent task steps; an already approved in-flight provider request may finish.
-
-## CopilotKit Rich Threads
-
-Every deployment requires `CPK_INTELLIGENCE_API_KEY` on the API server for CopilotKit Intelligence conversation persistence and replay. Create or select a project with `npx copilotkit@latest login` and `npx copilotkit@latest project select`, set the generated server-only key, and restart the API. The native menu uses `useThreads`; rich tool results link back to saved tasks, documents, and browser sessions.
-
-Intelligence is a separate service and is not included in this repository's MIT license. No project key is shipped. [Configuration and validation boundaries](docs/RICH-THREADS.md).
-
-## Signup and runtime tracking
-
-The CopilotKit SDK sends runtime telemetry through the shared CopilotKit sink to PostHog with `accessibility_title: "OpenMuse"`. Telemetry defaults to full capture; explicit SDK opt-outs and sampling settings take precedence. Keep the CLI-generated `CPK_TELEMETRY_ID` alongside the server-only project key when deploying. Intelligence records completed account signups separately; OpenMuse runtime usage can be joined to those accounts after the sink resolves the identity. [Setup, opt-out and PostHog validation](docs/TELEMETRY.md).
+---
 
 ## Architecture
 
-```mermaid
-flowchart TD
-  Client[Expo / React Native / Web] -->|AG-UI and authenticated API| API[Hono + CopilotKit runtime]
-  API --> Tasks[Durable task worker]
-  API --> Threads[CopilotKit Intelligence required in every mode]
-  API --> Store[(PGlite or PostgreSQL)]
-  Tasks --> Store
-  Tasks --> Review[Stored action review]
-  Review --> Google[Gmail / Calendar adapters]
-  Tasks --> Browser[Chromium worker + persistent profiles]
-  API --> Browser
-  API --> Computer[Optional Docker Linux computer]
-  Tasks --> Computer
-  Computer --> Volume[(Persistent workspace volume)]
-  Tasks --> Files[PDF files + structured artifacts]
-  API -. future adapter .-> OpenBot[OpenBot]
+```
+apps/web          Next.js dashboard (PWA) + BFF (holds the bearer, proxies the runtime)
+apps/mobile       Expo app (iOS / Android / web)
+apps/server       Hono API + CopilotKit runtime + durable task engine
+  engine/         tools (chat + durable), task worker, service layer
+  omnipong/       typed HTTP client for the domain service
+  onboarding/     profile + area resolution (no literals)
+apps/worker       Playwright browser worker (token-protected, persistent profiles)
+services/omnipong Vendored OmniPong FastAPI service (Apache-2.0)
+packages/domain   Shared schemas and types
+docs/             Build plan, verification notes, and upstream documentation
 ```
 
-| Directory | Purpose |
-| --- | --- |
-| `apps/mobile` | Shared iOS, Android, and web UI with CopilotKit headless hooks. |
-| `apps/server` | API, CopilotKit runtime, identity boundary, task engine, reviews, files, and persistence. |
-| `apps/worker` | Token-protected Playwright browser service with persistent profiles. |
-| `apps/computer` | Nonroot Linux image, bounded filesystem helper, and real container verification. |
-| `packages/domain` | Shared types and request validation. |
-| `packages/integrations` | Google and browser protocol adapters. |
-| `packages/backends` | Optional OpenBot HTTP adapter and its identity boundary. |
-| `tests` | Workflow, runtime, persistence, provider-contract, and authorization tests. |
+The dashboard and the native app both speak to `apps/server`; the server speaks to
+`services/omnipong` over HTTP (`POST /agent/action`, `/tools/*`). The agent never talks to a
+scraper directly, so the domain logic stays in Python and the product stays portable.
 
-### OpenBot compatibility
+Tool registration lives in two places, by design:
 
-OpenMuse's native client and personal-agent workflows are independent of OpenBot. The disabled OpenBot adapter is pinned and contract-tested against upstream interfaces. Live user/session bridging, routine mapping, and computer backend wiring remain future work. OpenBot's Intelligence runtime is not a raw AG-UI endpoint. [Integration contract](docs/OPENBOT-INTEGRATION.md).
+- `apps/server/src/engine/conversation.ts` — fast, read-only tools that answer a chat turn.
+- `apps/server/src/engine/model.ts` — durable tools that become tasks with leases, retries,
+  approvals, and receipts (`sync_data`, `sync_league`, `signup_tournament`, `watch_tournament`).
 
-## Development
+---
+
+## Data and credentials
+
+| Data | Where it comes from | Credentials |
+| --- | --- | --- |
+| USATT rating and number | OmniPong service / USATT lookups | none (public) |
+| League matches and set scores | Stadium TT public league pages | none (public) |
+| Tournament calendar, events, fees | omnipong.com public pages | none for reading |
+| Tournament signup | OmniPong service | your own browser session, with approval; real signups are opt-in |
+
+Your app state (profile, tasks, goals, watches, memories) lives in the agent server's data
+directory (`.openmuse/` by default, PGlite or Postgres). Chat threads live in CopilotKit
+Intelligence, keyed by your project.
+
+---
+
+## Testing
 
 ```sh
-pnpm lint
-pnpm typecheck
-pnpm test
-pnpm build:server
-pnpm build:web
-pnpm build:ios
-pnpm build:android
-pnpm --dir apps/worker typecheck
-pnpm test:browser
-pnpm test:computer
+pnpm typecheck     # server + native app
+pnpm test          # 550 tests
+pnpm lint          # Biome
+
+cd services/omnipong && .venv/bin/python -m pytest tests -q   # domain service
 ```
 
-Platform build scripts export JavaScript/Hermes bundles; they do not produce signed app binaries. Browser checks use controlled HTTP fixtures; the local check requires installed Chromium, and the container check requires Docker and registry access to build its image. CI also exercises the browser and Linux computer containers. See [contribution guidance](CONTRIBUTING.md) and [verification results](docs/VERIFICATION.md).
+---
 
-## Contributing and license
+## Documentation
 
-Issues and pull requests are welcome. Start with [CONTRIBUTING.md](CONTRIBUTING.md), [ROADMAP.md](ROADMAP.md), and the [security policy](SECURITY.md).
+- [`docs/SETUP.md`](docs/SETUP.md) — **start here**: the five in-app steps, then the one-time host setup for Google Calendar and Twilio texts.
+- [`docs/OPENPONG_BUILD_PLAN.md`](docs/OPENPONG_BUILD_PLAN.md) — locked decisions, phases, review findings, and the definition of done.
+- [`services/omnipong/README.md`](services/omnipong/README.md) — the domain service: endpoints, environment, Docker.
+- [`apps/web/README.md`](apps/web/README.md) — the dashboard and its BFF.
+- Upstream docs for the inherited harness remain in [`docs/`](docs/) (computer, browser worker, Rich Threads, deployment).
 
-MIT licensed. Built by CopilotKit. Its original interface and fictional assets are included. Website, email, and document content supplies evidence, not permission to act.
+## Deploying
+
+The full recipe is in [`docs/DEPLOY.md`](docs/DEPLOY.md): three topologies (local dev, a single
+VPS with Docker Compose, and a managed split), an env-var matrix for every process, health checks
+and smoke tests, scaling/durability notes, and a security checklist. In short — the agent server
+(Node, 8787), the dashboard (Next.js, 3000) and the Python domain service (8000) are independent
+processes that talk over HTTP; the domain service bakes Chromium, so it must run on a real
+container host, not Cloudflare Workers. The root [`render.yaml`](render.yaml) is now OpenPong's own
+Blueprint (api + dashboard + private domain service + Postgres), not the inherited OpenMuse one.
+
+Locally it is the three processes from the quick start (`pnpm dev`, `pnpm dev:dashboard`, and the
+domain service). For the whole stack on one host, it is one command after you fill in `.env`:
+
+```sh
+docker compose --env-file .env -f infra/compose.yaml up -d --build
+```
+
+## License
+
+MIT (see [`LICENSE`](LICENSE)) for the OpenPong harness, with Apache-2.0 components
+vendored from OmniPong. See [`NOTICE`](NOTICE) for the full attribution; upstream notices are
+preserved.

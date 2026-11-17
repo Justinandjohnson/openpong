@@ -5,6 +5,18 @@ import type { Config } from "./config.ts";
 import type { Store } from "./db.ts";
 import { AppError } from "./errors.ts";
 
+/**
+ * Lets the app create and manage calendars it made itself — the Pong calendar —
+ * without granting access to any calendar the person already owns. Requested
+ * only by the calendar connect path, never by mail.
+ */
+export const CALENDAR_APP_CREATED_SCOPE = "https://www.googleapis.com/auth/calendar.app.created";
+const BASE_SCOPES = [
+  "https://www.googleapis.com/auth/gmail.readonly",
+  "https://www.googleapis.com/auth/calendar.events.readonly",
+  "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+];
+
 const tokenSchema = z.object({
   access_token: z.string().min(1),
   refresh_token: z.string().optional(),
@@ -97,7 +109,14 @@ export class GoogleAuth {
       }
     }
   }
-  async connect(owner: string, write: boolean) {
+  /**
+   * Begin an authorization-code + PKCE flow. `write` asks for mail send and
+   * event write; `options.calendarApp` additionally asks for
+   * `calendar.app.created` so the Pong calendar path can create and manage
+   * only the calendar this app made. Existing grants are accumulated, never
+   * dropped, so adding the calendar scope does not regress mail or events.
+   */
+  async connect(owner: string, write: boolean, options: { calendarApp?: boolean } = {}) {
     if (!this.configured())
       throw new AppError(
         "Configure GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET and TOKEN_ENCRYPTION_KEY to connect Google",
@@ -109,9 +128,7 @@ export class GoogleAuth {
     const existing = this.decodeTokens(previous);
     const scopes = Array.from(
       new Set([
-        "https://www.googleapis.com/auth/gmail.readonly",
-        "https://www.googleapis.com/auth/calendar.events.readonly",
-        "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+        ...BASE_SCOPES,
         ...(existing?.scopes ?? []),
         ...(write
           ? [
@@ -119,6 +136,7 @@ export class GoogleAuth {
               "https://www.googleapis.com/auth/calendar.events",
             ]
           : []),
+        ...(options.calendarApp ? [CALENDAR_APP_CREATED_SCOPE] : []),
       ]),
     );
     await this.db.put("system", "oauth", {
@@ -143,6 +161,13 @@ export class GoogleAuth {
       code_challenge: createHash("sha256").update(verifier).digest("base64url"),
     }).toString();
     return { url: url.toString() };
+  }
+  /**
+   * The one-button calendar connect: the Pong calendar needs `calendar.app.created`
+   * in addition to the read scopes, but not Gmail send or broad event write.
+   */
+  async connectCalendar(owner: string) {
+    return this.connect(owner, false, { calendarApp: true });
   }
   async callback(stateId: string, code: string) {
     const state = await this.db.take<OAuthState>("system", "oauth", stateId);

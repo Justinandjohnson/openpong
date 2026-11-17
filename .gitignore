@@ -11,3 +11,6 @@ apps/mobile/android/
 .DS_Store
 *.tsbuildinfo
 artifacts/
+
+# local demo database (never committed)
+.demo/

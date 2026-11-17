@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
-  assertApiDeploymentConfig,
   browserWorkerUrl,
   type Config,
+  intelligenceConfigured,
   readConfig,
   shadowedEnvKeys,
 } from "../apps/server/src/config.ts";
@@ -28,29 +28,42 @@ function liveConfig(intelligenceApiKey?: string): Config {
   };
 }
 
-const missingKeyMessage =
-  "OpenMuse requires CPK_INTELLIGENCE_API_KEY. " +
-  "Run `npx copilotkit@latest login` and `npx copilotkit@latest project select`, " +
-  "then set the generated server-only key. " +
-  "See https://docs.copilotkit.ai/intelligence/connect-your-runtime";
-
-test("every API mode rejects a missing or blank Intelligence key", () => {
+test("every API mode accepts a missing or blank Intelligence key", () => {
   for (const mode of [sampleConfig, liveConfig()]) {
     for (const key of [undefined, "", " \t\n"]) {
-      assert.throws(() => assertApiDeploymentConfig({ ...mode, intelligenceApiKey: key }), {
-        name: "Error",
-        message: missingKeyMessage,
-      });
+      const config = { ...mode, intelligenceApiKey: key };
+      assert.equal(intelligenceConfigured(config), false);
+      assert.equal(config.intelligenceApiKey, key);
     }
   }
 });
 
-test("every API mode accepts a non-empty Intelligence key", () => {
+test("every API mode reports Rich Threads as configured with a non-empty key", () => {
   for (const mode of [sampleConfig, liveConfig()]) {
-    assert.doesNotThrow(() =>
-      assertApiDeploymentConfig({ ...mode, intelligenceApiKey: "test-project-key-never-sent" }),
+    assert.equal(
+      intelligenceConfigured({ ...mode, intelligenceApiKey: "test-project-key-never-sent" }),
+      true,
     );
   }
+});
+
+test("readConfig keeps a bootable config when the Intelligence key is absent", (t) => {
+  const previous = { ...process.env };
+  t.after(() => {
+    process.env = previous;
+  });
+  process.env.WORKSPACE_MODE = "sample";
+  process.env.AGENT_BACKEND = "model";
+  process.env.HOST = "127.0.0.1";
+  delete process.env.CPK_INTELLIGENCE_API_KEY;
+  const config = readConfig();
+  assert.equal(config.intelligenceApiKey, undefined);
+  assert.equal(intelligenceConfigured(config), false);
+  process.env.CPK_INTELLIGENCE_API_KEY = "  ";
+  assert.equal(readConfig().intelligenceApiKey, undefined);
+  process.env.CPK_INTELLIGENCE_API_KEY = "  test-project-key-never-sent  ";
+  assert.equal(readConfig().intelligenceApiKey, "test-project-key-never-sent");
+  assert.equal(intelligenceConfigured(readConfig()), true);
 });
 
 test("web search is enabled by default with an explicit opt-out", (t) => {

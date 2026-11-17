@@ -8,13 +8,24 @@ import {
   type AgentTask,
   type AgentWorkspace,
   createTaskSchema,
+  DEFAULT_SCOUT_HOUR,
   type Evidence,
   type Goal,
   goalInputSchema,
   type Idea,
+  isProfileOnboarded,
+  MAX_SEEN_TOURNAMENTS,
   type Monitor,
   monitorInputSchema,
+  nextScoutRun,
+  type OwnerProfile,
+  ownerProfileSchema,
   type RunEvent,
+  type ScoutSettings,
+  type ScoutView,
+  scoutSettingsSchema,
+  type TournamentSignupInput,
+  tournamentWatchSchema,
 } from "../../../../packages/domain/src/agent.ts";
 import type {
   ActionProposal,
@@ -25,12 +36,21 @@ import type {
 } from "../../../../packages/domain/src/index.ts";
 import type { ActionService } from "../actions.ts";
 import type { BrowserService } from "../browser.ts";
+import { CalendarService } from "../calendar/service.ts";
 import { ComputerService } from "../computer.ts";
 import type { Config } from "../config.ts";
 import type { Store } from "../db.ts";
 import { AppError } from "../errors.ts";
 import type { Files } from "../files.ts";
 import { backgroundFailure } from "../log.ts";
+import { defaultOmniPongServiceUrl, OmniPongService } from "../omnipong/service.ts";
+import {
+  areaFor,
+  areaLabel,
+  narrowTournaments,
+  resolveTournamentRegion,
+} from "../onboarding/area.ts";
+import { RelayClient, RelayError } from "../relay/client.ts";
 import { SearchService } from "../search.ts";
 import type { WorkspaceService } from "../workspace.ts";
 import { analyzeSpending } from "./finance.ts";
@@ -52,6 +72,8 @@ const terminal = new Set(["succeeded", "failed", "cancelled"]);
 export class AgentService {
   readonly worker: TaskWorker;
   readonly search: SearchService;
+  /** The Pong calendar hub: Google secondary calendar or tokenised iCal feed. */
+  readonly calendar: CalendarService;
   private maintenance?: ReturnType<typeof setInterval>;
   private refreshing = false;
   constructor(
@@ -62,10 +84,29 @@ export class AgentService {
     readonly actions: ActionService,
     readonly browser: BrowserService,
     readonly computer: ComputerService = new ComputerService(db, config),
+    // The OmniPong Python service fronts the table-tennis domain (Phase 1). It is
+    // optional: with no service running, tools still resolve and fail cleanly.
+    readonly omnipong: OmniPongService = new OmniPongService({
+      baseUrl: config.omnipongServiceUrl ?? defaultOmniPongServiceUrl,
+      token: config.omnipongServiceToken,
+    }),
+    // The relay's operator control plane: which of the owner's computers are
+    // paired/connected, and any pending human gate. Optional — without a URL
+    // the status reads "not configured" instead of throwing.
+    readonly relay: RelayClient = new RelayClient({
+      url: config.relayUrl,
+      token: config.relayToken,
+    }),
   ) {
     this.search = new SearchService(db);
+    this.calendar = new CalendarService(db, config, {
+      omnipong: this.omnipong,
+      profile: (owner) => this.getProfile(owner),
+      publicUrl: config.publicUrl,
+    });
     this.worker = new TaskWorker(db, (owner, task, context) => this.execute(owner, task, context), {
       settled: (owner, task) => this.publishOutcome(owner, task),
+      scheduleScout: (owner, settings) => this.scheduleScout(owner, settings),
     });
   }
   start() {
@@ -129,8 +170,169 @@ export class AgentService {
   async ensure(owner: string) {
     await this.db.insertIfAbsent(owner, "agent-settings", {
       id: "identity",
-      name: "OpenMuse",
+      name: "OpenPong",
       tone: "warm",
+    });
+  }
+  /** The owner's own profile record, or null before first-run onboarding. */
+  async getProfile(owner: string): Promise<OwnerProfile | null> {
+    const profile = await this.db.get<OwnerProfile>(owner, "agent-settings", "profile");
+    return profile && isProfileOnboarded(profile) ? profile : null;
+  }
+  /**
+   * Validate and persist the owner profile. Invalid input is a 400, never a
+   * stored default: blank optional values are dropped so an empty form field
+   * does not become a setting.
+   */
+  async saveProfile(owner: string, raw: unknown): Promise<OwnerProfile> {
+    const parsed = ownerProfileSchema.safeParse(raw);
+    if (!parsed.success)
+      throw new AppError(parsed.error.issues.map((issue) => issue.message).join("; "), 400);
+    const input = parsed.data;
+    const clean = {
+      ...input,
+      usattId: input.usattId?.trim() || undefined,
+      homeRegion: input.homeRegion?.trim() || undefined,
+      cities: input.cities?.filter(Boolean),
+      states: input.states?.filter(Boolean),
+      clubs: input.clubs?.filter(Boolean),
+      leagueUrls: input.leagueUrls?.filter(Boolean),
+    };
+    const profile: OwnerProfile = { ...clean, id: "profile", updatedAt: date() };
+    return this.db.put(owner, "agent-settings", profile);
+  }
+  /** `GET /api/agent/profile`: the record plus first-run detection. */
+  async profileView(owner: string): Promise<{ profile: OwnerProfile | null; onboarded: boolean }> {
+    const profile = await this.getProfile(owner);
+    return { profile, onboarded: isProfileOnboarded(profile) };
+  }
+  /** The owner's area resolved from their profile (no literal fallback). */
+  async ownerArea(owner: string) {
+    return areaFor(await this.getProfile(owner));
+  }
+  /**
+   * The owner's daily-scout setting, normalised. A missing record is the
+   * documented default (disabled, 08:00) and is never written by a read.
+   */
+  private async readScout(owner: string): Promise<ScoutSettings> {
+    const saved = await this.db.get<Partial<ScoutSettings>>(owner, "agent-settings", "scout");
+    const hour =
+      Number.isInteger(saved?.hour) && Number(saved?.hour) >= 0 && Number(saved?.hour) <= 23
+        ? Number(saved?.hour)
+        : DEFAULT_SCOUT_HOUR;
+    return {
+      id: "scout",
+      enabled: saved?.enabled === true,
+      hour,
+      ...(typeof saved?.nextRunAt === "string" ? { nextRunAt: saved.nextRunAt } : {}),
+      ...(typeof saved?.lastRunAt === "string" ? { lastRunAt: saved.lastRunAt } : {}),
+      ...(saved?.lastResult ? { lastResult: saved.lastResult } : {}),
+      seenTournamentIds: Array.isArray(saved?.seenTournamentIds)
+        ? saved.seenTournamentIds.filter(
+            (value): value is string => typeof value === "string" && value.length > 0,
+          )
+        : [],
+    };
+  }
+  /** `GET /api/agent/scout`: the setting plus the last run's outcome. */
+  async scoutView(owner: string): Promise<ScoutView> {
+    const { enabled, hour, nextRunAt, lastRunAt, lastResult, seenTournamentIds } =
+      await this.readScout(owner);
+    return {
+      enabled,
+      hour,
+      ...(nextRunAt ? { nextRunAt } : {}),
+      ...(lastRunAt ? { lastRunAt } : {}),
+      ...(lastResult ? { lastResult } : {}),
+      seenCount: seenTournamentIds.length,
+    };
+  }
+  /**
+   * `PUT /api/agent/scout`. Turning the scout on (or moving its hour) writes the
+   * next local occurrence of that hour; turning it off clears the schedule so a
+   * later re-enable starts fresh instead of firing a stale catch-up.
+   */
+  async saveScout(owner: string, raw: unknown): Promise<ScoutView> {
+    const parsed = scoutSettingsSchema.safeParse(raw);
+    if (!parsed.success)
+      throw new AppError(parsed.error.issues.map((issue) => issue.message).join("; "), 400);
+    const patch = parsed.data;
+    const current = await this.readScout(owner);
+    const next: ScoutSettings = { ...current };
+    if (patch.hour !== undefined) next.hour = patch.hour;
+    if (patch.enabled !== undefined) next.enabled = patch.enabled;
+    if (next.enabled) next.nextRunAt = nextScoutRun(next.hour);
+    else next.nextRunAt = undefined;
+    await this.db.put(owner, "agent-settings", next);
+    return this.scoutView(owner);
+  }
+  /**
+   * The worker found the owner's scout due: claim the schedule slot, then queue
+   * the durable run. The compare-and-swap is what makes "once a day" exact even
+   * with several workers ticking at the same instant.
+   */
+  async scheduleScout(owner: string, settings: ScoutSettings): Promise<void> {
+    if (settings.enabled !== true) return;
+    const hour =
+      Number.isInteger(settings.hour) && settings.hour >= 0 && settings.hour <= 23
+        ? settings.hour
+        : DEFAULT_SCOUT_HOUR;
+    const advanced = nextScoutRun(hour, new Date());
+    const claimed = await this.db.compareAndSwap<ScoutSettings>(
+      owner,
+      "agent-settings",
+      "scout",
+      settings.nextRunAt ? { nextRunAt: settings.nextRunAt } : { enabled: true },
+      { nextRunAt: advanced, hour },
+    );
+    if (!claimed) return;
+    const label = areaLabel(await this.ownerArea(owner));
+    await this.createTask(
+      owner,
+      {
+        kind: "scout",
+        title: "Daily tournament scout",
+        prompt: `Check ${label} for new tournaments and announce anything not seen before.`,
+      },
+      `scout:${settings.nextRunAt ?? advanced}`,
+    );
+  }
+  /**
+   * `POST /api/agent/scout/run`: queue one run now, independent of the schedule
+   * (and even while the daily switch is off). Like the scheduled run it is a
+   * durable task, so it survives a restart and dedupes against the same ledger.
+   */
+  async runScoutNow(owner: string): Promise<AgentTask> {
+    return this.createTask(owner, {
+      kind: "scout",
+      title: "Daily tournament scout",
+      prompt: "Check my area for new tournaments and announce anything not seen before.",
+    });
+  }
+  /**
+   * `POST /api/agent/sync`: the dashboard's one-tap sync.
+   *
+   * Deterministic by design — no model turn, no guessing. The league URL and the
+   * player name come from the saved profile; if either is missing the owner gets
+   * an actionable 400 instead of a vague failure. Running it twice is safe: the
+   * league sync is idempotent, and two clicks collapse onto one open task.
+   */
+  async runSyncNow(owner: string): Promise<AgentTask> {
+    const profile = await this.getProfile(owner);
+    const leagueUrls = (profile?.leagueUrls ?? []).filter(Boolean);
+    if (leagueUrls.length === 0)
+      throw new AppError(
+        "Add your league URL in Settings first — then this button can pull your matches.",
+        400,
+      );
+    const open = (await this.db.list<AgentTask>(owner, "tasks")).find(
+      (task) => task.kind === "sync" && !terminal.has(task.status),
+    );
+    if (open) return open;
+    return this.createTask(owner, {
+      kind: "sync",
+      title: "Sync league matches",
+      prompt: "Refresh league matches from the league URL saved in my profile.",
     });
   }
   async snapshot(owner: string): Promise<AgentWorkspace> {
@@ -155,7 +357,7 @@ export class AgentService {
       memories,
       artifacts,
       notifications,
-      identity: identity ?? { name: "OpenMuse", tone: "warm" },
+      identity: identity ?? { name: "OpenPong", tone: "warm" },
       worker: {
         running:
           this.worker.running ||
@@ -218,7 +420,16 @@ export class AgentService {
           ? ["Check the source", "Compare with the last observation", "Report a meaningful change"]
           : input.kind === "finance"
             ? ["Validate transactions", "Calculate the summary", "Save your tracker"]
-            : ["Understand the outcome", "Plan the work", "Use connected tools", "Return a result"];
+            : input.kind === "scout"
+              ? ["Read your area tournaments", "Compare with the last run", "Announce anything new"]
+              : input.kind === "sync"
+                ? ["Read your saved league", "Pull every match", "Save new results"]
+                : [
+                    "Understand the outcome",
+                    "Plan the work",
+                    "Use connected tools",
+                    "Return a result",
+                  ];
     const task: AgentTask = {
       id,
       title: input.title ?? input.prompt.slice(0, 90),
@@ -558,6 +769,58 @@ export class AgentService {
     }
     throw new AppError("The watch changed while updating. Try again.", 409);
   }
+  /**
+   * Create the recurring tournament watch (`watch_tournament`). It reuses the
+   * monitor task/lease/dedup machinery; the worker's observe branch runs
+   * OmniPong's `check` scout each interval. The region comes from the tool
+   * argument or the owner's profile — never a literal default.
+   */
+  async createTournamentMonitor(owner: string, raw: unknown, idempotencyKey?: string) {
+    const input = tournamentWatchSchema.parse(raw);
+    const id = idempotencyKey ? hash(`tournament-monitor:${idempotencyKey}`) : randomUUID();
+    const existing = await this.db.get<Monitor>(owner, "monitors", id);
+    if (existing) {
+      await this.activateMonitor(owner, existing);
+      return existing;
+    }
+    const profile = await this.getProfile(owner);
+    const area = areaFor(profile);
+    const region = resolveTournamentRegion(input.region, area);
+    const label = areaLabel({ ...area, ...(region ? { region } : {}) });
+    const keywords = input.keywords.map((keyword) => keyword.trim()).filter(Boolean);
+    const title = keywords.length
+      ? `Watch ${label} tournaments: ${keywords.join(", ")}`
+      : `Watch ${label} tournaments`;
+    const task = await this.createTask(
+      owner,
+      {
+        kind: "monitor",
+        title,
+        prompt: `Watch ${label} tournaments${keywords.length ? ` for ${keywords.join(", ")}` : ""}`,
+        input: { monitorId: id },
+      },
+      `tournament-monitor:${id}`,
+      true,
+    );
+    const monitor: Monitor = {
+      id,
+      taskId: task.id,
+      title,
+      url: "omnipong://tournaments",
+      condition: "change",
+      value: "",
+      intervalMinutes: 120,
+      status: "active",
+      nextCheckAt: date(),
+      checks: 0,
+      kind: "tournament",
+      ...(region ? { region } : {}),
+      keywords,
+    };
+    await this.db.insertIfAbsent(owner, "monitors", monitor);
+    await this.activateMonitor(owner, monitor);
+    return monitor;
+  }
   async refreshIdeas(owner: string) {
     const w = await this.workspace.snapshot(owner);
     const sentIds = new Set(
@@ -766,12 +1029,16 @@ export class AgentService {
     context: TaskContext,
   ) {
     await context.guard();
-    const connection = await this.workspace.connection(owner);
-    if (connection?.id !== task.state.connectionId)
-      throw new AppError(
-        "Google connection changed during this task. Start a new task using the current account.",
-        409,
-      );
+    // Google actions are bound to the connection captured when the task
+    // started; a table-tennis registration is not, so it does not gate on it.
+    if (input.kind !== "omnipong.signup") {
+      const connection = await this.workspace.connection(owner);
+      if (connection?.id !== task.state.connectionId)
+        throw new AppError(
+          "Google connection changed during this task. Start a new task using the current account.",
+          409,
+        );
+    }
     const proposal = await this.actions.propose(owner, input, `${task.id}:${key}`, task.id);
     if (proposal.status === "succeeded") return proposal;
     if (proposal.status !== "awaiting_review" && proposal.status !== "executing")
@@ -798,6 +1065,156 @@ export class AgentService {
       );
     return proposal;
   }
+  /**
+   * Runs the real OmniPong registration for an approved `omnipong.signup`
+   * proposal and returns a receipt. This is only ever reached through the
+   * reviewed-action executor after a human approval; approval is never derived
+   * from chat or model input.
+   */
+  async executeApprovedSignup(data: TournamentSignupInput): Promise<string> {
+    // Defense in depth: re-check the operator flag at execution time. A proposal
+    // prepared while real signup was enabled can therefore never register after
+    // the flag is turned off (for example, a direct /api/actions approval or a
+    // process that restarted with the flag unset).
+    if (!this.config.omnipongAllowRealSignup)
+      throw new Error(
+        "Real tournament signup is disabled on this server (OMNIPONG_ALLOW_REAL_SIGNUP is not true). No registration was made.",
+      );
+    const events = data.events ?? [];
+    const result = await this.omnipong.runAction("signup", {
+      title: data.title,
+      ...(events.length ? { events } : {}),
+    });
+    const record =
+      result && typeof result === "object" ? (result as Record<string, unknown>) : undefined;
+    const status = typeof record?.status === "string" ? record.status : undefined;
+    const message = typeof record?.message === "string" ? record.message : undefined;
+    if (status === "error")
+      throw new Error(message ?? `Tournament registration for “${data.title}” failed`);
+    const selectedRaw = record?.events_selected;
+    const selected = Array.isArray(selectedRaw) ? selectedRaw.map(String) : events;
+    const chosen = selected.length ? ` Events: ${selected.join(", ")}.` : "";
+    return `Registered for “${data.title}”.${message ? ` ${message}.` : ""}${chosen}`;
+  }
+  /**
+   * Dry-run preview for `signup_tournament`: reads the owner's area tournaments
+   * and returns what a registration WOULD enter. It never registers anyone and
+   * is the only behavior unless real signup is explicitly enabled on the server.
+   */
+  async previewSignup(data: TournamentSignupInput) {
+    const provided = data.events ?? [];
+    let tournament: Record<string, unknown> | undefined;
+    let events = provided;
+    try {
+      const list = await this.omnipong.getTournaments();
+      tournament = list.find(
+        (item) =>
+          typeof item.title === "string" &&
+          item.title.trim().toLowerCase() === data.title.trim().toLowerCase(),
+      );
+      if (!events.length && tournament && Array.isArray(tournament.events))
+        events = (tournament.events as unknown[])
+          .map((event) =>
+            event && typeof event === "object"
+              ? (event as Record<string, unknown>).name
+              : undefined,
+          )
+          .filter((name): name is string => typeof name === "string" && Boolean(name.trim()))
+          .slice(0, 50);
+    } catch {
+      // The preview must still work offline; it just cannot enrich the entry.
+    }
+    return {
+      mode: "dry_run" as const,
+      realSignupEnabled: false as const,
+      registered: false,
+      wouldRegister: {
+        title: data.title,
+        events,
+        // With no events named or matched, the service's own matcher would pick
+        // events at registration time; this preview never invents them.
+        eventsChosen: events.length > 0,
+      },
+      tournament: tournament
+        ? {
+            title: tournament.title,
+            date: tournament.date_range ?? tournament.date,
+            location: tournament.city_state ?? tournament.location,
+            url: tournament.url,
+          }
+        : null,
+      note: "Dry run: nobody was registered. Real signup is disabled on this server (OMNIPONG_ALLOW_REAL_SIGNUP is not true). A real registration would also require the owner's separate approval in the native app.",
+    };
+  }
+  /**
+   * `GET /api/agent/companion`: the owner's "Your computer" state. Read-only
+   * and owner-scoped. Never throws for a relay that is down — an unreachable
+   * relay is reported as reachable:false so the UI and coach can say so.
+   */
+  async companionStatus(owner: string) {
+    if (!this.relay.configured)
+      return {
+        configured: false,
+        reachable: false,
+        owner,
+        paired: false,
+        connected: false,
+        gates: [] as { gate_id: string; kind: string; hint: string; url_host: string }[],
+      };
+    try {
+      const status = await this.relay.status(owner);
+      return { configured: true, reachable: true, ...status };
+    } catch (error) {
+      return {
+        configured: true,
+        reachable: false,
+        owner,
+        paired: false,
+        connected: false,
+        gates: [] as { gate_id: string; kind: string; hint: string; url_host: string }[],
+        error: error instanceof Error ? error.message : "Relay unreachable",
+      };
+    }
+  }
+  /**
+   * `POST /api/agent/companion/pairing`: mint (or rotate) the owner's pairing
+   * token at the relay and return the command to run on their own computer. The
+   * token is a secret and is returned exactly once here.
+   */
+  async startCompanionPairing(owner: string) {
+    if (!this.relay.configured)
+      throw new AppError(
+        "The relay is not configured on this server (RELAY_URL is unset), so a computer cannot be paired yet.",
+        503,
+      );
+    try {
+      return await this.relay.startPairing(owner);
+    } catch (error) {
+      throw new AppError(
+        error instanceof Error ? error.message : "Could not start pairing",
+        error instanceof RelayError && error.status === 503 ? 503 : 502,
+      );
+    }
+  }
+  /** `DELETE /api/agent/companion`: revoke the owner's pairing at the relay. */
+  async unpairCompanion(owner: string) {
+    if (!this.relay.configured) return { owner, revoked: false };
+    try {
+      return await this.relay.unpair(owner);
+    } catch (error) {
+      throw new AppError(error instanceof Error ? error.message : "Could not unpair", 502);
+    }
+  }
+  /** `POST /api/agent/companion/gates/:id/clear`: "I handled it, continue". */
+  async clearCompanionGate(owner: string, gateId: string) {
+    if (!this.relay.configured)
+      throw new AppError("The relay is not configured on this server", 503);
+    try {
+      return await this.relay.clearGate(owner, gateId);
+    } catch (error) {
+      throw new AppError(error instanceof Error ? error.message : "Could not clear the gate", 502);
+    }
+  }
   private async execute(
     owner: string,
     task: AgentTask,
@@ -819,6 +1236,19 @@ export class AgentService {
           state: { ...task.state, approvalResult: action.result },
           actionId: null,
         });
+      } else if (action.status === "denied" || action.status === "cancelled") {
+        // A human saying no is the system working, not a failure. Close the task
+        // cleanly with a receipt that says exactly what did not happen.
+        return {
+          status: "cancelled",
+          result: "You declined this action. Nothing was sent or registered.",
+          error: null,
+          plan: task.plan.map((step) =>
+            step.status === "running" || step.status === "pending"
+              ? { ...step, status: "failed" as const, detail: "Declined by you" }
+              : step,
+          ),
+        };
       } else if (action.status !== "awaiting_review" && action.status !== "executing")
         throw new Error(
           `Reviewed action ${action.status}: ${action.error ?? "No further action was taken"}`,
@@ -826,6 +1256,8 @@ export class AgentService {
       else return { status: "waiting_approval" };
     }
     if (task.kind === "document") return this.document(owner, task, context);
+    if (task.kind === "scout") return this.scout(owner, task, context);
+    if (task.kind === "sync") return this.syncLeagueTask(owner, task, context);
     if (task.kind === "monitor") {
       try {
         return await this.observe(owner, task, context);
@@ -908,13 +1340,16 @@ export class AgentService {
   private async publishOutcome(owner: string, saved: AgentTask) {
     const task = await this.getTask(owner, saved.id);
     if (task.status === "succeeded") {
-      await this.notify(
-        owner,
-        task.title,
-        task.result ?? "Work completed",
-        task.id,
-        `task-done:${task.id}`,
-      );
+      // A scout's own notifications are the new tournaments it found; a generic
+      // "task done" notice every day would bury them and break the dedupe rule.
+      if (task.kind !== "scout")
+        await this.notify(
+          owner,
+          task.title,
+          task.result ?? "Work completed",
+          task.id,
+          `task-done:${task.id}`,
+        );
       if (task.goalId && !task.milestoneId) {
         for (let attempt = 0; attempt < 8; attempt++) {
           const goal = await this.db.get<Goal>(owner, "goals", task.goalId);
@@ -1074,6 +1509,7 @@ export class AgentService {
     if (!monitor) throw new Error("Monitor not found");
     if (monitor.status !== "active")
       return { status: monitor.status === "paused" ? "paused" : "cancelled" };
+    if (monitor.kind === "tournament") return this.observeTournaments(owner, task, monitor, ctx);
     let observation: { url: string; title: string; text: string; sessionId?: string };
     if (monitor.url === "sample://availability") {
       if (this.config.mode !== "sample") throw new Error("Sample source unavailable");
@@ -1201,6 +1637,324 @@ export class AgentService {
       ],
       plan: task.plan.map((s) => ({ ...s, status: "succeeded" })),
     };
+  }
+  /**
+   * One deterministic league sync for the dashboard button.
+   *
+   * No model turn: the league URL and owner name come from the saved profile, so
+   * the result is the same whoever clicks and wherever they click it. The Python
+   * service does the paging/completeness work and is idempotent, which makes a
+   * retry (or two racing clicks) harmless.
+   */
+  private async syncLeagueTask(
+    owner: string,
+    task: AgentTask,
+    ctx: TaskContext,
+  ): Promise<Partial<AgentTask>> {
+    await ctx.guard();
+    const profile = await this.getProfile(owner);
+    const leagueUrls = (profile?.leagueUrls ?? []).filter(Boolean);
+    if (leagueUrls.length === 0)
+      throw new Error(
+        "No league URL is saved for this owner yet. Add one in Settings, then press Sync again.",
+      );
+    await ctx.event("status", "Pulling league matches", `${leagueUrls.length} league page(s)`);
+    await ctx.checkpoint({
+      plan: task.plan.map((step, index) => ({
+        ...step,
+        status: index === 0 ? "succeeded" : index === 1 ? "running" : "pending",
+      })),
+    });
+    const result = await this.omnipong.syncLeague({
+      leagueUrls,
+      owner: profile?.displayName,
+      allMatches: true,
+    });
+    await ctx.guard();
+    const seen = Number(result.owner_matches ?? 0);
+    const inserted = Number(result.inserted ?? 0);
+    const updated = Number(result.updated ?? 0);
+    const warnings = Array.isArray(result.errors) ? result.errors.length : 0;
+    const summary = `Synced ${seen} match${seen === 1 ? "" : "es"} · ${inserted} new, ${updated} updated${
+      warnings ? `, ${warnings} warning${warnings === 1 ? "" : "s"}` : ""
+    }`;
+    await this.notify(owner, "League sync finished", summary, task.id, `sync:${task.id}`);
+    return {
+      status: "succeeded",
+      result: summary,
+      error: null,
+      evidence: [
+        ...task.evidence,
+        {
+          id: randomUUID(),
+          kind: "web",
+          title: "League sync",
+          excerpt: summary,
+        },
+      ],
+      plan: task.plan.map((step) => ({ ...step, status: "succeeded" })),
+      state: { ...task.state, lastSyncAt: date(), seen, inserted, updated },
+    };
+  }
+  /**
+   * One pass of the always-on daily scout. Reads the owner's area list, diffs it
+   * against the persisted `seenTournamentIds` ledger, announces each genuinely
+   * new tournament once, then records the outcome and the next daily run.
+   *
+   * Dedupe is exact in two independent places: the ledger check here, and the
+   * per-identity notification key (`notify` inserts by id, so even two racing
+   * runs can never announce the same tournament twice).
+   */
+  private async scout(
+    owner: string,
+    task: AgentTask,
+    ctx: TaskContext,
+  ): Promise<Partial<AgentTask>> {
+    await ctx.guard();
+    const area = await this.ownerArea(owner);
+    const label = areaLabel(area);
+    let rows: Record<string, unknown>[];
+    try {
+      // No region argument of our own: the profile's area (or the service's
+      // configured area when the profile has none) decides what "my area" is.
+      rows = await this.omnipong.getTournaments(resolveTournamentRegion(undefined, area));
+    } catch (error) {
+      // Advance the schedule first: a service outage must not wedge the daily
+      // loop, so the next occurrence still runs.
+      await this.advanceScout(owner);
+      throw new Error(
+        `The tournament scout could not read ${label} tournaments: ${
+          error instanceof Error ? error.message : "the service is unavailable"
+        }`,
+      );
+    }
+    await ctx.guard();
+    const candidates = this.tournamentCandidates(narrowTournaments(rows, area));
+    const { seenTournamentIds } = await this.readScout(owner);
+    const seen = new Set(seenTournamentIds);
+    const fresh = candidates.filter((tournament) => !seen.has(tournament.id));
+    await ctx.event(
+      "observation",
+      fresh.length ? "Found new tournaments" : "Checked for new tournaments",
+      fresh.length
+        ? fresh.map((tournament) => tournament.title).join(", ")
+        : `${candidates.length} listing(s), none new`,
+    );
+    for (const tournament of fresh) {
+      await ctx.guard();
+      await this.notify(
+        owner,
+        "New tournament found",
+        `New tournament in ${label}: ${tournament.title}`,
+        task.id,
+        `scout:${tournament.id}`,
+      );
+    }
+    // A new-tournament alert is also worth a text, but only when the owner has
+    // a number on file and the install allows it. Best-effort by design: the
+    // domain service answers `sent:false` with a reason and never throws, and an
+    // SMS outage must not fail the scout run that triggered it.
+    let smsNote: string | undefined;
+    if (fresh.length > 0 && this.config.smsAlertsEnabled) {
+      try {
+        const sent = await this.omnipong.sendSms(
+          `OpenPong: ${fresh.length} new tournament${fresh.length === 1 ? "" : "s"} in ${label} — ${fresh
+            .slice(0, 2)
+            .map((tournament) => tournament.title)
+            .join("; ")}${fresh.length > 2 ? ` +${fresh.length - 2} more` : ""}`,
+        );
+        if (sent.sent !== true) {
+          smsNote = typeof sent.detail === "string" ? sent.detail : "Text alert was not sent.";
+        }
+      } catch (error) {
+        smsNote = error instanceof Error ? error.message : "Text alert failed.";
+      }
+    }
+    // Re-read so a setting change made while the fetch ran (for example the
+    // owner turning the scout off) is preserved rather than overwritten.
+    const latest = await this.readScout(owner);
+    const ledger = [...new Set([...latest.seenTournamentIds, ...fresh.map((t) => t.id)])].slice(
+      -MAX_SEEN_TOURNAMENTS,
+    );
+    const result = {
+      found: candidates.length,
+      newCount: fresh.length,
+    };
+    await this.db.put<ScoutSettings>(owner, "agent-settings", {
+      ...latest,
+      nextRunAt: nextScoutRun(latest.hour),
+      lastRunAt: date(),
+      lastResult: result,
+      seenTournamentIds: ledger,
+    });
+    if (smsNote) await ctx.event("observation", "Text alert skipped", smsNote);
+    await ctx.event(
+      "result",
+      fresh.length ? "New tournaments are ready to review" : "Nothing new today",
+      fresh.length
+        ? fresh.map((tournament) => tournament.title).join(", ")
+        : `${candidates.length} listing(s) already seen`,
+    );
+    return {
+      status: "succeeded",
+      result: fresh.length
+        ? `New tournaments found: ${fresh.map((t) => t.title).join(", ")}. A notification is ready.`
+        : "No new tournaments today. I'll check again tomorrow.",
+      state: { ...task.state, ...result },
+      plan: task.plan.map((step) => ({ ...step, status: "succeeded" })),
+      error: null,
+    };
+  }
+  /** Move the next daily run forward without claiming a successful run. */
+  private async advanceScout(owner: string) {
+    const latest = await this.readScout(owner);
+    await this.db.put<ScoutSettings>(owner, "agent-settings", {
+      ...latest,
+      nextRunAt: nextScoutRun(latest.hour),
+    });
+  }
+  /**
+   * Stable identities for tournament rows. OmniPong's `source_id` is the real
+   * row key, so it wins; stored URLs, then title+date+location, are fallbacks.
+   * A row with no stable identity is skipped rather than announced repeatedly.
+   */
+  private tournamentCandidates(list: unknown): { id: string; title: string }[] {
+    if (!Array.isArray(list)) return [];
+    const rows = new Map<string, string>();
+    for (const entry of list) {
+      if (!entry || typeof entry !== "object") continue;
+      const row = entry as Record<string, unknown>;
+      const text = (value: unknown) => (value == null ? "" : String(value).trim());
+      const title = text(row.title);
+      const identity =
+        [row.source_id, row.id, row.tournament_id, row.slug, row.url, row.omnipong_url]
+          .map(text)
+          .find(Boolean) ||
+        [title, text(row.date_range) || text(row.date), text(row.city_state) || text(row.location)]
+          .filter(Boolean)
+          .join("|");
+      if (!identity) continue;
+      if (!rows.has(identity)) rows.set(identity, title || identity);
+    }
+    return [...rows].map(([id, title]) => ({ id, title }));
+  }
+  /**
+   * One pass of a recurring tournament watch. Runs OmniPong's `check` scout and
+   * raises one notification per newly-appearing matching tournament. A title is
+   * announced once: the per-title notification key plus the task's `seen` ledger
+   * keep re-runs idempotent even when a lease is lost mid-pass.
+   */
+  private async observeTournaments(
+    owner: string,
+    task: AgentTask,
+    monitor: Monitor,
+    ctx: TaskContext,
+  ): Promise<Partial<AgentTask>> {
+    await ctx.guard();
+    // Prefer the read-only tournament list: it works from the service's database
+    // with no browser or stored credentials. Only fall back to OmniPong's live
+    // `check` scout (which needs a signed-in browser) when that read fails.
+    let candidates: string[];
+    try {
+      // The monitor's region is whatever the owner set (or their profile's
+      // region); with neither, the query is omitted so the service applies
+      // its own configuration instead of a default from this server.
+      const area = await this.ownerArea(owner);
+      const tournaments = await this.omnipong.getTournaments(
+        resolveTournamentRegion(monitor.region, area),
+      );
+      candidates = this.tournamentNames(narrowTournaments(tournaments, area));
+    } catch {
+      await ctx.guard();
+      const result = await this.omnipong.runAction("check", { dry_run: false, deep: false });
+      candidates = this.tournamentTitles(result);
+    }
+    const seen = new Set<string>(
+      Array.isArray(task.state.seenTournaments)
+        ? (task.state.seenTournaments as unknown[]).filter(
+            (value): value is string => typeof value === "string",
+          )
+        : [],
+    );
+    const keywords = (monitor.keywords ?? []).map((keyword) => keyword.toLowerCase());
+    const fresh = candidates.filter(
+      (title) =>
+        !seen.has(title) &&
+        (keywords.length === 0 ||
+          keywords.some((keyword) => title.toLowerCase().includes(keyword))),
+    );
+    await ctx.guard();
+    const label = monitor.region ? `${monitor.region} area` : "your area";
+    for (const title of fresh) {
+      seen.add(title);
+      await this.notify(
+        owner,
+        monitor.title,
+        `New ${label} tournament: ${title}`,
+        task.id,
+        `tournament:${monitor.id}:${hash(title)}`,
+      );
+    }
+    const nextCheckAt = new Date(Date.now() + monitor.intervalMinutes * 60000).toISOString();
+    const savedMonitor = await this.db.compareAndSwap(
+      owner,
+      "monitors",
+      monitor.id,
+      { status: "active", checks: monitor.checks },
+      {
+        checks: monitor.checks + 1,
+        lastCheckedAt: date(),
+        lastValue: fresh.join(" | ").slice(0, 1000),
+        nextCheckAt,
+        error: null,
+      },
+    );
+    if (!savedMonitor) throw new LostLeaseError();
+    await ctx.event(
+      "observation",
+      fresh.length ? "Found new tournaments" : "Checked for new tournaments",
+      fresh.length ? fresh.join(", ") : `${candidates.length} listing(s), none new`,
+    );
+    return {
+      status: "scheduled",
+      nextRunAt: nextCheckAt,
+      result: fresh.length
+        ? `New tournaments found: ${fresh.join(", ")}. A notification is ready.`
+        : "Watching. I'll check again on schedule.",
+      state: {
+        ...task.state,
+        // Keep a bounded ledger so a long-lived watch cannot grow without end.
+        seenTournaments: [...seen].slice(-1000),
+        resumingMonitor: false,
+        failures: 0,
+        notice: null,
+      },
+      error: null,
+    };
+  }
+  /** Titles OmniPong's `check` scout newly announced, deduped and in order. */
+  private tournamentTitles(result: unknown): string[] {
+    if (!result || typeof result !== "object") return [];
+    const notified = (result as Record<string, unknown>).notified;
+    if (!Array.isArray(notified)) return [];
+    const titles = new Set<string>();
+    for (const entry of notified) {
+      if (!entry || typeof entry !== "object") continue;
+      const title = (entry as Record<string, unknown>).title;
+      if (typeof title === "string" && title.trim()) titles.add(title.trim());
+    }
+    return [...titles];
+  }
+  /** Titles from the read-only tournament list (array of records with `title`). */
+  private tournamentNames(list: unknown): string[] {
+    if (!Array.isArray(list)) return [];
+    const titles = new Set<string>();
+    for (const entry of list) {
+      if (!entry || typeof entry !== "object") continue;
+      const title = (entry as Record<string, unknown>).title;
+      if (typeof title === "string" && title.trim()) titles.add(title.trim());
+    }
+    return [...titles];
   }
   private matchesPrice(text: string, threshold: number) {
     const matches = [...text.matchAll(/(?:\$|USD)\s*(\d+(?:,\d{3})*(?:\.\d{1,2})?)/g)];

@@ -14,7 +14,7 @@ import { GoogleClient } from "../../../packages/integrations/src/google.ts";
 import { createSamplePdf } from "../../../packages/integrations/src/pdf.ts";
 import type { ActionService } from "./actions.ts";
 import { agentConfigured } from "./agent.ts";
-import type { Config } from "./config.ts";
+import { type Config, intelligenceConfigured } from "./config.ts";
 import type { Store } from "./db.ts";
 import { AppError } from "./errors.ts";
 import type { Files } from "./files.ts";
@@ -364,7 +364,7 @@ export class WorkspaceService {
         provider: this.config.agentBackend === "sample" ? "sample" : "model",
         configured: agentConfigured(this.config),
         openbotConfigured: false,
-        richThreads: true,
+        richThreads: intelligenceConfigured(this.config),
       },
     };
   }
@@ -390,6 +390,9 @@ export class WorkspaceService {
     };
   }
   async prepare(owner: string, input: ProposalInput, connectionId?: string) {
+    // Tournament registrations never route through the Google workspace.
+    if (input.kind === "omnipong.signup")
+      throw new AppError("Tournament registrations are not Google actions", 409);
     if (input.kind === "email.send") {
       for (const id of input.data.attachmentIds) await this.files.get(owner, id);
       return { input };
@@ -414,6 +417,9 @@ export class WorkspaceService {
     connectionId?: string,
     targetVersion?: string,
   ): Promise<string> {
+    // Tournament registrations never route through the Google workspace.
+    if (input.kind === "omnipong.signup")
+      throw new AppError("Tournament registrations are not Google actions", 409);
     if (this.config.mode === "sample") {
       if (input.kind === "email.send") {
         const id = randomUUID();

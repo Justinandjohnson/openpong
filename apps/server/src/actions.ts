@@ -28,6 +28,14 @@ interface Options {
   connection?: (owner: string) => Promise<{ id: string; account: string } | null>;
   now?: () => number;
 }
+/** Proposal kinds that run against the owner's Google account (and need its connection). */
+const GOOGLE_KINDS = new Set<ProposalInput["kind"]>([
+  "email.send",
+  "calendar.create",
+  "calendar.update",
+  "calendar.delete",
+]);
+const needsGoogle = (kind: ProposalInput["kind"]) => GOOGLE_KINDS.has(kind);
 export class ActionService {
   private readonly now: () => number;
   constructor(
@@ -35,6 +43,15 @@ export class ActionService {
     private readonly options: Options,
   ) {
     this.now = options.now ?? Date.now;
+  }
+  /**
+   * Every stored proposal for the owner, newest first. Approvals used to happen
+   * only in the native app; the dashboard's Activity view reads this list so the
+   * same review, approve and deny works from any surface. Read-only.
+   */
+  async list(owner: string): Promise<ActionProposal[]> {
+    const actions = await this.db.list<ActionProposal>(owner, "actions");
+    return actions.sort((a, b) => (b.createdAt ?? "").localeCompare(a.createdAt ?? ""));
   }
   async propose(
     owner: string,
@@ -51,17 +68,23 @@ export class ActionService {
       if (existing) return existing;
     }
     const parsed = proposalSchema.parse(raw);
-    const connection = await this.options.connection?.(owner);
-    if (this.options.connection && !connection)
+    const google = needsGoogle(parsed.kind);
+    // Only Google actions require (and record) the Google connection.
+    const connection = google ? await this.options.connection?.(owner) : null;
+    if (google && this.options.connection && !connection)
       throw new AppError("Connect Google before preparing an action", 409);
-    const prepared = await this.options.prepare?.(owner, parsed, connection?.id);
+    const prepared = google
+      ? await this.options.prepare?.(owner, parsed, connection?.id)
+      : undefined;
     const input = proposalSchema.parse(prepared?.input ?? parsed);
     const title =
       input.kind === "email.send"
         ? `Send “${input.data.subject}”`
         : input.kind === "calendar.delete"
           ? `Delete ${input.data.title}`
-          : `${input.kind === "calendar.create" ? "Create" : "Update"} ${input.data.title}`;
+          : input.kind === "omnipong.signup"
+            ? `Register for ${input.data.title}`
+            : `${input.kind === "calendar.create" ? "Create" : "Update"} ${input.data.title}`;
     const createdAt = new Date(this.now()).toISOString();
     const proposal: ActionProposal = {
       id,
@@ -133,9 +156,13 @@ export class ActionService {
       }
       throw new AppError("This review expired. Create a fresh proposal.", 409);
     }
-    if (decision === "approve" && !(await this.options.connected(owner)))
+    if (
+      decision === "approve" &&
+      needsGoogle(proposal.kind) &&
+      !(await this.options.connected(owner))
+    )
       throw new AppError("Google is disconnected. Reconnect before approving this action.", 409);
-    if (decision === "approve" && this.options.connection) {
+    if (decision === "approve" && needsGoogle(proposal.kind) && this.options.connection) {
       const connection = await this.options.connection(owner);
       if (
         !connection ||

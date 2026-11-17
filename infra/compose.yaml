@@ -1,31 +1,179 @@
-name: openmuse
+# OpenPong — single-host Docker Compose (the recommended self-host).
+#
+# Four services: Postgres, the Python domain service, the agent server, and the
+# Next.js dashboard. Everything shares one network; only the dashboard is meant
+# to face the internet (put a TLS reverse proxy in front of it).
+#
+# Run it from the repository root so the shared `.env` is interpolated AND
+# loaded into the containers:
+#
+#   cp .env.example .env          # then edit it (see docs/DEPLOY.md)
+#   docker compose --env-file .env -f infra/compose.yaml up -d --build
+#
+# `--env-file .env` is required for the ${VAR:?} checks below and for
+# `docker compose config`. The `env_file:` entries below pass the same file into
+# the containers (path is relative to this file, so ../.env = repo-root .env).
+#
+# This stack runs the agent server in live mode, which is the only mode that can
+# bind 0.0.0.0 inside a container. See docs/DEPLOY.md for the full walkthrough.
+name: openpong
+
 services:
-  browser-worker:
-    build:
-      context: ../apps/worker
-    init: true
+  postgres:
+    image: postgres:16-alpine
     restart: unless-stopped
     environment:
-      WORKER_HOST: 0.0.0.0
-      WORKER_TOKEN: ${WORKER_TOKEN:?Set WORKER_TOKEN to a random secret of at least 32 characters}
-    ports:
-      - "127.0.0.1:8790:8790"
+      POSTGRES_USER: ${POSTGRES_USER:-openpong}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-openpong}
     volumes:
-      - browser-profiles:/data
-    tmpfs:
-      - /tmp:size=256m,mode=1777
-    shm_size: 256mb
-    mem_limit: 2g
-    pids_limit: 256
-    read_only: true
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
+      - postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8790/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-openpong} -d ${POSTGRES_DB:-openpong}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - openpong
+
+  # Python/FastAPI domain service: ratings, matches, tournaments, league sync,
+  # SMS webhook. It ships Chromium, so it must run on a real container host
+  # (never Cloudflare Workers).
+  omnipong:
+    build:
+      context: ../services/omnipong
+    restart: unless-stopped
+    init: true
+    env_file:
+      - path: ../.env
+        required: false
+    environment:
+      OMNIPONG_DB: /data/omnipong.db
+      # Shared secret; the agent server and dashboard send it as a bearer token.
+      OMNIPONG_SERVICE_TOKEN: ${OMNIPONG_SERVICE_TOKEN:?Set OMNIPONG_SERVICE_TOKEN in .env}
+    volumes:
+      # SQLite database and Playwright profiles both persist across restarts.
+      - omnipong-data:/data
+      - omnipong-profiles:/app/playwright_data
+    ports:
+      # Loopback only: the dashboard/BFF and the agent server reach it over the
+      # compose network. Do not publish this to the internet.
+      - "127.0.0.1:8000:8000"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request,sys; urllib.request.urlopen('http://127.0.0.1:8000/', timeout=4); sys.exit(0)",
+        ]
       interval: 15s
       timeout: 5s
-      retries: 3
+      retries: 5
+    networks:
+      - openpong
+
+  # Hono API + CopilotKit runtime + durable task engine.
+  api:
+    build:
+      context: ..
+      dockerfile: Dockerfile.backend
+    restart: unless-stopped
+    init: true
+    env_file:
+      - path: ../.env
+        required: false
+    environment:
+      HOST: 0.0.0.0
+      PORT: "8787"
+      # Live mode is required: sample mode refuses a non-loopback HOST, which a
+      # container needs.
+      WORKSPACE_MODE: live
+      AGENT_BACKEND: model
+      MODEL: ${MODEL:-google/gemini-2.5-flash}
+      DATA_DIR: /data
+      # Postgres instead of the embedded PGlite store, so the API is stateless
+      # and can scale out (see docs/DEPLOY.md).
+      DATABASE_URL: postgresql://${POSTGRES_USER:-openpong}:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-openpong}
+      PUBLIC_API_URL: ${PUBLIC_API_URL:-http://localhost:8787}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000}
+      OMNIPONG_SERVICE_URL: http://omnipong:8000
+      OMNIPONG_SERVICE_TOKEN: ${OMNIPONG_SERVICE_TOKEN:?Set OMNIPONG_SERVICE_TOKEN in .env}
+      OPENMUSE_ACCESS_KEY: ${OPENMUSE_ACCESS_KEY:?Set OPENMUSE_ACCESS_KEY (24+ chars) in .env}
+      TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:?Set TOKEN_ENCRYPTION_KEY (32-byte base64) in .env}
+      TASK_WORKER_ENABLED: "true"
+    volumes:
+      # session-signing-key, files/, and (without DATABASE_URL) the PGlite dir.
+      - api-data:/data
+    ports:
+      - "127.0.0.1:8787:8787"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      omnipong:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:8787/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - openpong
+
+  # Next.js dashboard + BFF. Holds the bearer and proxies the agent server.
+  web:
+    build:
+      context: ..
+      dockerfile: Dockerfile.frontend
+    restart: unless-stopped
+    init: true
+    env_file:
+      - path: ../.env
+        required: false
+    environment:
+      PORT: "3000"
+      OPENPONG_SERVER_URL: http://api:8787
+      OMNIPONG_SERVICE_URL: http://omnipong:8000
+      OMNIPONG_SERVICE_TOKEN: ${OMNIPONG_SERVICE_TOKEN:?Set OMNIPONG_SERVICE_TOKEN in .env}
+      # Must be identical on every dashboard instance so the AES-GCM sealed
+      # cookie can be opened after a restart or scale-out.
+      OPENPONG_COOKIE_SECRET: ${OPENPONG_COOKIE_SECRET:?Set OPENPONG_COOKIE_SECRET in .env}
+      # Used by the single-owner fallback; harmless when MULTI_TENANT is on.
+      OPENPONG_ACCESS_KEY: ${OPENMUSE_ACCESS_KEY:?Set OPENMUSE_ACCESS_KEY in .env}
+    ports:
+      # The only port a TLS reverse proxy should expose.
+      - "127.0.0.1:3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:3000/offline').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - openpong
+
 volumes:
-  browser-profiles:
+  postgres-data:
+  api-data:
+  omnipong-data:
+  omnipong-profiles:
+
+networks:
+  openpong:
+    driver: bridge

@@ -2,7 +2,8 @@ import "./config.ts";
 import { randomUUID } from "node:crypto";
 import { MessageSchema } from "@ag-ui/core";
 import { CopilotKitIntelligence } from "@copilotkit/runtime/v2";
-import { Hono } from "hono";
+import { getConnInfo } from "@hono/node-server/conninfo";
+import { type Context, Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { cors } from "hono/cors";
 import { z } from "zod";
@@ -11,13 +12,24 @@ import {
   emailDraftSchema,
   proposalSchema,
 } from "../../../packages/domain/src/index.ts";
+import {
+  type Account,
+  AccountService,
+  LoginRateLimitError,
+  type RequestContext,
+} from "./accounts.ts";
 import { ActionService } from "./actions.ts";
 import { agentConfigured, makeRuntime } from "./agent.ts";
-import { createAuth } from "./auth.ts";
+import { createAuth, multiTenantEnabled } from "./auth.ts";
 import { BrowserService } from "./browser.ts";
+import { calendarFeedHandler } from "./calendar/routes.ts";
 import { ComputerService, type DockerRunner, resolveComputerDeployment } from "./computer.ts";
 import { computerRoutes } from "./computer-routes.ts";
-import { assertApiDeploymentConfig, type Config } from "./config.ts";
+import {
+  type Config,
+  intelligenceConfigured,
+  intelligenceThreadsDisabledMessage,
+} from "./config.ts";
 import type { Store } from "./db.ts";
 import { agentRoutes } from "./engine/routes.ts";
 import { AgentService } from "./engine/service.ts";
@@ -32,23 +44,53 @@ export async function createApp(
   config: Config,
   options: { docker?: DockerRunner } = {},
 ) {
-  assertApiDeploymentConfig(config);
   await resolveComputerDeployment(config);
   const auth = await createAuth(db, config),
     files = new Files(db, config, auth),
     google = new GoogleAuth(db, config),
     workspace = new WorkspaceService(db, config, files, google);
+  const multiTenant = multiTenantEnabled();
+  const accounts = new AccountService(db, config);
+  const requestContext = (c: Context): RequestContext => {
+    let address: string | undefined;
+    try {
+      address = getConnInfo(c).remote.address;
+    } catch {
+      // in-memory app.request() has no socket
+      address = undefined;
+    }
+    const forwarded = c.req.header("x-forwarded-for")?.split(",")[0]?.trim();
+    const realIp = c.req.header("x-real-ip");
+    return {
+      ip: config.trustProxy ? forwarded || realIp || address : address,
+      userAgent: c.req.header("user-agent"),
+    };
+  };
+  // A real tournament registration executes through the agent service, which
+  // owns the OmniPong client. `agent` is assigned just below; this closure
+  // reads it at approval time, never at construction time.
+  let agent!: AgentService;
   const actions = new ActionService(db, {
     execute: (owner, input, connectionId, targetVersion) =>
-      workspace.execute(owner, input, connectionId, targetVersion),
-    prepare: (owner, input, connectionId) => workspace.prepare(owner, input, connectionId),
+      input.kind === "omnipong.signup"
+        ? agent.executeApprovedSignup(input.data)
+        : workspace.execute(owner, input, connectionId, targetVersion),
+    prepare: (owner, input, connectionId) =>
+      input.kind === "omnipong.signup"
+        ? Promise.resolve({ input })
+        : workspace.prepare(owner, input, connectionId),
     connected: (owner) => workspace.connected(owner),
     connection: (owner) => workspace.connection(owner),
   });
   const browser = new BrowserService(db, config, auth, files);
   const computer = new ComputerService(db, config, options.docker);
-  const agent = new AgentService(db, config, workspace, files, actions, browser, computer);
-  const intelligence = new CopilotKitIntelligence({ apiKey: config.intelligenceApiKey });
+  agent = new AgentService(db, config, workspace, files, actions, browser, computer);
+  // Rich Threads are opt-in. Without a key the runtime runs native AG-UI:
+  // chat streams and tools run, but conversations do not sync across devices.
+  const intelligenceApiKey = config.intelligenceApiKey?.trim();
+  const intelligence = intelligenceApiKey
+    ? new CopilotKitIntelligence({ apiKey: intelligenceApiKey })
+    : undefined;
   const runtime = makeRuntime(config, agent, auth, intelligence);
   const app = new Hono<{ Variables: { owner: string } }>();
   const origins = new Set([...config.allowedOrigins, new URL(config.publicUrl).origin]);
@@ -102,11 +144,16 @@ export async function createApp(
       mode: config.mode,
       agentConfigured: agentConfigured(config),
       browserConfigured: Boolean(config.workerUrl && config.workerToken),
+      threadsConfigured: intelligenceConfigured(config),
     }),
   );
   let loginWindow = 0,
     loginAttempts = 0;
   app.post("/api/session", async (c) => {
+    // Multi-tenant servers close the shared access-key flow; signup/login mint
+    // account-owned sessions instead. Never seed a "local-user" here.
+    if (multiTenant)
+      throw new AppError("Accounts are enabled on this server. Sign in or create an account.", 403);
     if (Date.now() - loginWindow > 60000) {
       loginWindow = Date.now();
       loginAttempts = 0;
@@ -120,18 +167,24 @@ export async function createApp(
     if (config.mode === "sample") await agent.refreshIdeas("local-user");
     return c.json(session);
   });
+  // Public, session-free iCal feed. The token in the path is the credential.
+  app.get("/api/calendar/feed/*", calendarFeedHandler(agent.calendar));
+
   app.get("/api/google/callback", async (c) => {
     if (c.req.query("error"))
-      return c.html("<h1>Google connection cancelled</h1><p>You can return to OpenMuse.</p>", 400);
+      return c.html("<h1>Google connection cancelled</h1><p>You can return to OpenPong.</p>", 400);
     const state = c.req.query("state"),
       code = c.req.query("code");
     if (!state || !code) throw new AppError("Google callback is incomplete");
     await google.callback(state, code);
     return c.html(
-      "<h1>Google is connected</h1><p>Return to OpenMuse and refresh your workspace.</p>",
+      "<h1>Google is connected</h1><p>Return to OpenPong and refresh your workspace.</p>",
     );
   });
   app.use("/api/*", async (c, next) => {
+    // Account routes authenticate themselves: signup/login are public, and the
+    // others return their own 401 (and Retry-After) shapes.
+    if (multiTenant && c.req.path.startsWith("/api/auth/")) return next();
     // A signed URL grants only the requests its page makes: reads, and the console's input.
     const method = c.req.method === "HEAD" ? "GET" : c.req.method;
     const signedRoute =
@@ -184,6 +237,11 @@ export async function createApp(
   );
   app.post("/api/actions", async (c) => {
     const input = proposalSchema.parse(await c.req.json());
+    // The review endpoint must not mint a real-signup proposal while the
+    // operator has real signup disabled. The durable task path already
+    // previews instead; this closes the direct-HTTP bypass too.
+    if (input.kind === "omnipong.signup" && !config.omnipongAllowRealSignup)
+      throw new AppError("Real tournament signup is disabled on this server", 409);
     if (input.kind === "email.send")
       for (const id of input.data.attachmentIds) await files.get(c.get("owner"), id);
     return c.json(await actions.propose(c.get("owner"), input), 201);
@@ -215,6 +273,9 @@ export async function createApp(
     );
   });
   app.get("/api/main-thread", async (c) => {
+    // Without a key there is no server-side thread ledger; say so plainly instead
+    // of attempting a platform call or leaving a half-created settings record.
+    if (!intelligence) throw new AppError(intelligenceThreadsDisabledMessage, 503);
     const owner = c.get("owner");
     await db.insertIfAbsent(owner, "conversation-settings", {
       id: "main",
@@ -357,7 +418,71 @@ export async function createApp(
     return new Response(body, { status: response.status, headers: response.headers });
   });
   app.get("/", (c) =>
-    c.json({ name: "OpenMuse", app: "http://localhost:8081", health: "/api/health" }),
+    c.json({ name: "OpenPong", app: "http://localhost:8081", health: "/api/health" }),
   );
+  // Multi-tenant account routes. Appended last so the single-owner routes above
+  // (and their order) stay untouched; they are only mounted when enabled.
+  if (multiTenant) {
+    /** Seed the account's own workspace, then mint a session owned by its id. */
+    const beginAccountSession = async (account: Account, context: RequestContext) => {
+      await workspace.ensureSample(account.id, actions);
+      await agent.ensure(account.id);
+      const session = await auth.sessionFor(account.id, context);
+      return session.token;
+    };
+    app.post("/api/auth/signup", async (c) => {
+      const body = z
+        .object({
+          email: z.string(),
+          password: z.string(),
+          displayName: z.string().optional(),
+        })
+        .parse(await c.req.json());
+      const context = requestContext(c);
+      const account = await accounts.signup(body.email, body.password, body.displayName, context);
+      const token = await beginAccountSession(account, context);
+      // Match the sample sign-in flow: the new workspace starts with suggestions.
+      if (config.mode === "sample") await agent.refreshIdeas(account.id);
+      return c.json({ token, account }, 201);
+    });
+    app.post("/api/auth/login", async (c) => {
+      const body = z.object({ email: z.string(), password: z.string() }).parse(await c.req.json());
+      const context = requestContext(c);
+      let account: Account;
+      try {
+        account = await accounts.login(body.email, body.password, context);
+      } catch (error) {
+        // Keep the Retry-After hint machine-readable, not just in the message.
+        if (error instanceof LoginRateLimitError)
+          return c.json({ error: error.message }, 429, {
+            "Retry-After": String(error.retryAfterSeconds),
+          });
+        throw error;
+      }
+      const token = await beginAccountSession(account, context);
+      return c.json({ token, account });
+    });
+    app.get("/api/auth/me", async (c) => {
+      const account = await accounts.get(await auth.owner(c.req.header("authorization")));
+      if (!account) throw new AppError("Account not found. Sign in again.", 401);
+      return c.json({ account });
+    });
+    app.post("/api/auth/logout", async (c) => {
+      const authorization = c.req.header("authorization");
+      const owner = await auth.owner(authorization);
+      // Audit before revoking: a failed audit must not leave an unrecorded logout.
+      await accounts.audit(owner, "logout", requestContext(c));
+      await auth.revoke(authorization);
+      return c.json({ ok: true });
+    });
+    app.post("/api/auth/password", async (c) => {
+      const owner = await auth.owner(c.req.header("authorization"));
+      const body = z
+        .object({ oldPassword: z.string(), newPassword: z.string() })
+        .parse(await c.req.json());
+      await accounts.changePassword(owner, body.oldPassword, body.newPassword, requestContext(c));
+      return c.json({ ok: true });
+    });
+  }
   return { app, auth, files, actions, workspace, agent, computer };
 }

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { AgentTask, RunEvent } from "../../../../packages/domain/src/agent.ts";
+import { DEFAULT_SCOUT_HOUR, type ScoutSettings } from "../../../../packages/domain/src/agent.ts";
 import type { Store } from "../db.ts";
 import { backgroundFailure } from "../log.ts";
 
@@ -36,6 +37,12 @@ export class TaskWorker {
       leaseMs?: number;
       pollMs?: number;
       settled?: (owner: string, task: AgentTask) => Promise<void>;
+      /**
+       * Queues the owner's daily tournament scout when its schedule is due. The
+       * worker owns the timing; the service owns turning a due owner into a
+       * durable task, so scheduling and execution stay independently testable.
+       */
+      scheduleScout?: (owner: string, settings: ScoutSettings) => Promise<void>;
     } = {},
   ) {}
   private now() {
@@ -75,6 +82,8 @@ export class TaskWorker {
     this.lastTickAt = new Date(this.now()).toISOString();
     const started: Promise<void>[] = [];
     try {
+      // Sweep first so a scout that just became due can be claimed by this tick.
+      await this.sweepScouts();
       const records = await this.db.scan<AgentTask>("tasks");
       const due = records.filter(
         ({ value: t }) =>
@@ -120,6 +129,28 @@ export class TaskWorker {
       this.ticking = false;
     }
     await Promise.all(started);
+  }
+  /**
+   * Once a day, per owner: queue the durable tournament scout when its stored
+   * `nextRunAt` has passed. A missing or unreadable schedule counts as due (the
+   * owner enabled the scout somewhere that did not write a schedule), so a
+   * missed run is caught up on the next tick rather than skipped silently.
+   */
+  private async sweepScouts() {
+    const schedule = this.options.scheduleScout;
+    if (!schedule) return;
+    for (const { owner, value } of await this.db.scan<ScoutSettings>("agent-settings")) {
+      if (value?.id !== "scout" || value.enabled !== true) continue;
+      const hour =
+        Number.isInteger(value.hour) && value.hour >= 0 && value.hour <= 23
+          ? value.hour
+          : DEFAULT_SCOUT_HOUR;
+      const due = Date.parse(value.nextRunAt ?? "");
+      if (Number.isFinite(due) && due > this.now()) continue;
+      await schedule(owner, { ...value, hour }).catch((error) =>
+        backgroundFailure("schedule daily scout", error),
+      );
+    }
   }
   private async run(owner: string, previous: AgentTask) {
     if (this.stopping) return;

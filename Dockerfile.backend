@@ -1,0 +1,36 @@
+# OpenPong agent server (apps/server) — Hono API + CopilotKit runtime + durable
+# task engine. Build from the repository root:
+#
+#   docker build -f Dockerfile.backend -t openpong-api .
+#
+# The server is the root package (apps/server is not a separate pnpm workspace
+# member), so it builds with the root tsconfig (pnpm build:server) and runs
+# node dist/apps/server/src/index.js. It listens on $PORT (default 8787) and
+# needs HOST=0.0.0.0 inside a container.
+FROM node:22-bookworm-slim AS build
+ENV PNPM_HOME=/pnpm PATH=/pnpm:$PATH
+RUN corepack enable
+WORKDIR /app
+# Workspace manifests + lockfile first for a cacheable install layer.
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
+COPY patches ./patches
+# apps/mobile, apps/worker and apps/web are pnpm workspace members, so their
+# manifests must be present for a --frozen-lockfile install to validate.
+COPY apps ./apps
+COPY packages ./packages
+COPY tsconfig.json tsconfig.build.json ./
+RUN pnpm install --frozen-lockfile
+RUN pnpm build:server
+
+FROM node:22-bookworm-slim
+ENV NODE_ENV=production
+WORKDIR /app
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+COPY --from=build /app/package.json ./package.json
+# DATA_DIR holds the embedded PGlite data dir (or points at Postgres) plus the
+# session-signing key; mount a volume at DATA_DIR in production.
+ENV DATA_DIR=/data
+RUN mkdir -p /data
+EXPOSE 8787
+CMD ["node", "dist/apps/server/src/index.js"]
