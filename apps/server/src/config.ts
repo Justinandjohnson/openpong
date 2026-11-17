@@ -41,6 +41,8 @@ export interface Config {
   port: number;
   host: string;
   publicUrl: string;
+  /** Where the dashboard lives, when the API and the app are separate hosts. */
+  publicAppUrl?: string;
   dataDir: string;
   databaseUrl?: string;
   accessKey?: string;
@@ -169,6 +171,7 @@ export function readConfig(): Config {
     port,
     host: process.env.HOST ?? "127.0.0.1",
     publicUrl,
+    publicAppUrl: process.env.PUBLIC_APP_URL?.trim() || undefined,
     dataDir: resolve(process.env.DATA_DIR ?? ".openmuse"),
     databaseUrl: process.env.DATABASE_URL,
     accessKey: process.env.OPENMUSE_ACCESS_KEY,

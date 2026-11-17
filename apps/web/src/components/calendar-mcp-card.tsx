@@ -1,11 +1,11 @@
 "use client";
 
-import { CalendarClock, CheckCircle2, Loader2, Plug, Sparkles } from "lucide-react";
+import { CheckCircle2, Loader2, Plug, Sparkles } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
+import { fetchGoogleStatus, type GoogleCalendarStatus } from "@/lib/google-calendar";
 
 const BASE = "/api/openpong/agent/calendar/mcp";
 
@@ -32,6 +32,7 @@ interface AgendaEvent {
  */
 export function CalendarMcpCard() {
   const [view, setView] = useState<McpView | null>(null);
+  const [google, setGoogle] = useState<GoogleCalendarStatus | null>(null);
   const [provider, setProvider] = useState<"google">("google");
   const [tools, setTools] = useState<string[] | null>(null);
   const [events, setEvents] = useState<AgendaEvent[] | null>(null);
@@ -46,6 +47,11 @@ export function CalendarMcpCard() {
       if (body.provider) setProvider(body.provider);
     } catch {
       setView({ configured: false });
+    }
+    try {
+      setGoogle(await fetchGoogleStatus());
+    } catch {
+      setGoogle(null);
     }
   }, []);
 
@@ -146,7 +152,7 @@ export function CalendarMcpCard() {
       </CardHeader>
       <CardContent className="flex flex-1 flex-col gap-3">
         <div className="flex flex-wrap items-center gap-2">
-          {view?.configured ? (
+          {view?.configured && google?.connected !== false ? (
             <Badge variant="success">
               <CheckCircle2 className="mr-1 size-3" /> {view.label}
             </Badge>
@@ -166,38 +172,57 @@ export function CalendarMcpCard() {
           </span>
           <span className="mt-1 block text-[11px] text-muted-foreground">
             Google&apos;s own Calendar MCP server — the coach reads the calendar you choose and only
-            ever adds an event you ask for. Connect Google above first.
+            ever adds an event you ask for. It uses the Google connection made above.
           </span>
         </div>
 
-        <Button onClick={save} disabled={busy === "save"} className="self-start">
-          {busy === "save" ? <Loader2 className="size-3.5 animate-spin" /> : null} Use my Google
-          Calendar
-        </Button>
-
-        <div className="flex flex-wrap gap-2">
-          <Button
-            variant="outline"
-            onClick={check}
-            disabled={!view?.configured || busy === "check"}
-          >
-            {busy === "check" ? <Loader2 className="size-3.5 animate-spin" /> : null} Test
-            connection
-          </Button>
-          <Button
-            variant="outline"
-            onClick={preview}
-            disabled={!view?.configured || busy === "preview"}
-          >
-            {busy === "preview" ? <Loader2 className="size-3.5 animate-spin" /> : null} Read next 7
-            days
-          </Button>
-          {view?.configured && (
-            <Button variant="ghost" onClick={disconnect} disabled={busy === "disconnect"}>
-              Disconnect
+        {google && !google.connected ? (
+          <p className="rounded-xl border border-border bg-background/40 px-3 py-2 text-[11px] leading-relaxed text-muted-foreground">
+            {google.configured ? (
+              <>
+                Connect Google Calendar first — that is the connection this card reads. Use the{" "}
+                <span className="font-semibold text-foreground">Connect Google Calendar</span>{" "}
+                button on this page, then come back.
+              </>
+            ) : (
+              <>
+                This server has no Google app configured, so this MCP connection cannot work. The
+                private iCal link on the calendar page still works, but it is write-only.
+              </>
+            )}
+          </p>
+        ) : (
+          <>
+            <Button onClick={save} disabled={busy === "save"} className="self-start">
+              {busy === "save" ? <Loader2 className="size-3.5 animate-spin" /> : null} Use my Google
+              Calendar
             </Button>
-          )}
-        </div>
+
+            <div className="flex flex-wrap gap-2">
+              <Button
+                variant="outline"
+                onClick={check}
+                disabled={!view?.configured || busy === "check"}
+              >
+                {busy === "check" ? <Loader2 className="size-3.5 animate-spin" /> : null} Test
+                connection
+              </Button>
+              <Button
+                variant="outline"
+                onClick={preview}
+                disabled={!view?.configured || busy === "preview"}
+              >
+                {busy === "preview" ? <Loader2 className="size-3.5 animate-spin" /> : null} Read
+                next 7 days
+              </Button>
+              {view?.configured && (
+                <Button variant="ghost" onClick={disconnect} disabled={busy === "disconnect"}>
+                  Disconnect
+                </Button>
+              )}
+            </div>
+          </>
+        )}
 
         {note && (
           <p className={`text-[11px] ${note.kind === "ok" ? "text-accent" : "text-destructive"}`}>
@@ -219,9 +244,9 @@ export function CalendarMcpCard() {
               </p>
             ) : (
               <ul className="flex flex-col gap-1">
-                {events.slice(0, 8).map((event, index) => (
+                {events.slice(0, 8).map((event) => (
                   <li
-                    key={`${event.title}-${index}`}
+                    key={`${event.calendar ?? ""}-${event.title}-${event.start ?? ""}`}
                     className="flex items-baseline gap-2 text-[11px]"
                   >
                     <span className="text-muted-foreground">

@@ -219,14 +219,9 @@ export class GoogleAuth {
     });
     if (!response.ok) throw new AppError("Google could not complete sign-in. Connect again.", 502);
     const token = tokenSchema.parse(await response.json());
-    const profile = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/profile", {
-      headers: { Authorization: `Bearer ${token.access_token}` },
-      signal: AbortSignal.timeout(15000),
-    });
-    if (!profile.ok)
-      throw new AppError("Google did not grant Gmail read access. Connect again.", 403);
-    const { emailAddress } = z.object({ emailAddress: z.email() }).parse(await profile.json());
+    const granted = token.scope?.split(" ") ?? state.scopes;
     const previous = await this.tokens(state.owner);
+    const account = await this.resolveAccount(granted, token.access_token, previous?.account);
     await this.save(
       state.owner,
       {
@@ -234,13 +229,36 @@ export class GoogleAuth {
         accessToken: token.access_token,
         refreshToken:
           token.refresh_token ??
-          (previous?.account === emailAddress ? previous.refreshToken : undefined),
+          (previous?.account === account ? previous.refreshToken : undefined),
         expiresAt: Date.now() + token.expires_in * 1000,
-        scopes: token.scope?.split(" ") ?? state.scopes,
-        account: emailAddress,
+        scopes: granted,
+        account,
       },
       state.generation,
     );
+  }
+
+  /**
+   * The email the connection belongs to. Gmail's profile endpoint is the only
+   * source this flow has ever requested, and it needs a Gmail scope: a
+   * calendar-only consent — the one-button Pong calendar — is not authorised for
+   * it, so it keeps the previous label instead of failing the whole connect.
+   */
+  private async resolveAccount(
+    scopes: readonly string[],
+    accessToken: string,
+    previousAccount?: string,
+  ): Promise<string> {
+    if (!scopes.some((scope) => scope.includes("/auth/gmail.")))
+      return previousAccount ?? "Google account";
+    const profile = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/profile", {
+      headers: { Authorization: `Bearer ${accessToken}` },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (!profile.ok)
+      throw new AppError("Google did not grant Gmail read access. Connect again.", 403);
+    const { emailAddress } = z.object({ emailAddress: z.email() }).parse(await profile.json());
+    return emailAddress;
   }
   async accessToken(owner: string, expectedConnectionId?: string): Promise<string> {
     const tokens = await this.tokens(owner);

@@ -21,6 +21,12 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { useOpenPong } from "@/lib/api";
+import {
+  fetchGoogleStatus,
+  GOOGLE_SETUP_DOC,
+  type GoogleCalendarStatus,
+  startGoogleConnect,
+} from "@/lib/google-calendar";
 import { type InstallState, subscribeInstall } from "@/lib/install";
 
 interface Profile {
@@ -95,6 +101,9 @@ export default function SetupPage() {
     null,
   );
   const [cal, setCal] = useState<CalendarStatus | null>(null);
+  const [google, setGoogle] = useState<GoogleCalendarStatus | null>(null);
+  const [googleLoaded, setGoogleLoaded] = useState(false);
+  const [googleNote, setGoogleNote] = useState<{ kind: "ok" | "error"; text: string } | null>(null);
   const user = useOpenPong<DomainUser>("/user");
 
   const [leagueDraft, setLeagueDraft] = useState("");
@@ -103,7 +112,7 @@ export default function SetupPage() {
   const [phoneDraft, setPhoneDraft] = useState("");
   const [phoneNote, setPhoneNote] = useState<string | null>(null);
   const [phoneBusy, setPhoneBusy] = useState(false);
-  const [calBusy, setCalBusy] = useState(false);
+  const [googleBusy, setGoogleBusy] = useState(false);
   const [nameDraft, setNameDraft] = useState("");
   const [nameNote, setNameNote] = useState<string | null>(null);
   const [nameBusy, setNameBusy] = useState(false);
@@ -134,6 +143,23 @@ export default function SetupPage() {
       .then((r) => (r.ok ? r.json() : null))
       .then((body) => alive && setCal(body))
       .catch(() => undefined);
+    return () => {
+      alive = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    let alive = true;
+    fetchGoogleStatus()
+      .then((status) => {
+        if (alive) setGoogle(status);
+      })
+      .catch(() => {
+        if (alive) setGoogle(null);
+      })
+      .finally(() => {
+        if (alive) setGoogleLoaded(true);
+      });
     return () => {
       alive = false;
     };
@@ -191,7 +217,11 @@ export default function SetupPage() {
   const hasName = Boolean(current?.displayName?.trim());
   const hasArea = Boolean(current?.cities?.length || current?.states?.length);
   const hasLeague = Boolean(current?.leagueUrls?.length);
-  const calendarDone = Boolean(cal?.connected);
+  // Google is the real connection; without a Google app the write-only iCal
+  // feed is the honest fallback and still counts as set up.
+  const googleConnected = Boolean(google?.connected);
+  const googleConfigured = Boolean(google?.configured);
+  const calendarDone = googleConnected || (!googleConfigured && Boolean(cal?.connected));
   const textsDone = Boolean(user.data?.phone_number);
 
   const required = [
@@ -270,29 +300,25 @@ export default function SetupPage() {
     );
   }
 
-  async function connectCalendar() {
-    setCalBusy(true);
-    const response = await fetch("/api/openpong/agent/calendar/connect", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({}),
-    }).catch(() => null);
-    const body = (await response?.json().catch(() => null)) as {
-      error?: string;
-      kind?: string;
-      url?: string;
-      feedUrl?: string;
-    } | null;
-    setCalBusy(false);
-    if (!response?.ok || !body) {
-      setCal({ connected: false });
-      return;
+  async function connectGoogle() {
+    setGoogleBusy(true);
+    setGoogleNote(null);
+    try {
+      const result = await startGoogleConnect();
+      if (result.url) {
+        window.location.assign(result.url);
+        return;
+      }
+      setGoogleNote({ kind: "ok", text: "Google is already connected." });
+    } catch (cause) {
+      setGoogleNote({
+        kind: "error",
+        text: cause instanceof Error ? cause.message : "Could not start the Google connection.",
+      });
+    } finally {
+      // Only reached when the browser is not navigating away.
+      setGoogleBusy(false);
     }
-    if (body.kind === "google" && body.url) {
-      window.location.href = body.url;
-      return;
-    }
-    setCal({ provider: "ics", connected: true, feedUrl: body.feedUrl });
   }
 
   return (
@@ -434,30 +460,80 @@ export default function SetupPage() {
         description="Google connects once so the coach can read the calendars you choose as context and keep a Pong calendar of your tournaments, sign-ups and results; Apple and Outlook subscribe to a private, write-only link."
         done={calendarDone}
       >
-        {calendarDone ? (
+        {!googleLoaded ? (
+          <p className="text-xs text-muted-foreground">Checking the Google connection…</p>
+        ) : google === null ? (
+          <p className="text-xs text-muted-foreground">
+            Could not check the Google connection here. Refresh the page to try again.
+          </p>
+        ) : !google.configured ? (
+          <div className="flex flex-col gap-2">
+            <p className="text-xs leading-snug text-muted-foreground">
+              This server has no Google app set up, so the coach cannot read your calendars here.
+              The private iCal link still works — it publishes the Pong calendar, but it is
+              write-only and cannot be read back.
+            </p>
+            <div className="flex flex-wrap items-center gap-2">
+              <a
+                href={GOOGLE_SETUP_DOC}
+                target="_blank"
+                rel="noreferrer"
+                className="text-xs font-bold text-accent underline"
+              >
+                Set up Google
+              </a>
+              <Link href="/calendar" className="text-xs font-bold text-accent underline">
+                Open the calendar hub
+              </Link>
+            </div>
+          </div>
+        ) : google.connected ? (
           <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
             <span className="flex items-center gap-1.5">
               <CalendarDays className="size-3.5" />
-              {cal?.provider === "google" ? "Google · Pong calendar" : "iCal subscription"}
+              Google · Pong calendar
             </span>
+            <button
+              type="button"
+              onClick={connectGoogle}
+              disabled={googleBusy}
+              className="font-bold text-accent underline"
+            >
+              Reconnect
+            </button>
             <Link href="/calendar" className="font-bold text-accent underline">
               Open the calendar hub
             </Link>
           </div>
         ) : (
-          <div className="flex flex-wrap items-center gap-2">
-            <Button size="sm" onClick={connectCalendar} disabled={calBusy}>
-              {calBusy ? (
-                <Loader2 className="size-3.5 animate-spin" />
-              ) : (
-                <CalendarDays className="size-3.5" />
-              )}
-              Connect a calendar
-            </Button>
-            <Link href="/calendar" className="text-xs font-bold text-accent underline">
-              See what lands in Pong
-            </Link>
+          <div className="flex flex-col gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              <Button size="sm" onClick={connectGoogle} disabled={googleBusy}>
+                {googleBusy ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : (
+                  <CalendarDays className="size-3.5" />
+                )}
+                Connect Google Calendar
+              </Button>
+              <Link href="/calendar" className="text-xs font-bold text-accent underline">
+                See what lands in Pong
+              </Link>
+            </div>
+            <p className="text-[11px] text-muted-foreground">
+              One tap and Google&apos;s consent screen asks for exactly what the coach needs. Apple
+              and Outlook can use the private, write-only link instead.
+            </p>
           </div>
+        )}
+        {googleNote && (
+          <p
+            className={`mt-2 text-[11px] ${
+              googleNote.kind === "ok" ? "text-accent" : "text-destructive"
+            }`}
+          >
+            {googleNote.text}
+          </p>
         )}
       </Step>
 

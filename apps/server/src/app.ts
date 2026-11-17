@@ -40,6 +40,38 @@ import { dashboardOrigin, GoogleIdentity } from "./google-identity.ts";
 import { rateLimit } from "./rate-limit.ts";
 import { WorkspaceService } from "./workspace.ts";
 
+/**
+ * Where the browser lands after a Google calendar consent. The dashboard is a
+ * web origin on the allowlist, never the API's own origin; when no allowed
+ * origin is known the caller keeps the server's own response.
+ */
+/**
+ * Where to send the browser after a consent. An explicit PUBLIC_APP_URL wins: the
+ * API usually runs on its own host, and the first allowed origin is often a native
+ * app or a stale dev port rather than the dashboard someone is actually using.
+ */
+function calendarDashboardBase(
+  allowedOrigins: readonly string[],
+  publicAppUrl?: string,
+): string | null {
+  const explicit = publicAppUrl ? dashboardOrigin(publicAppUrl) : null;
+  if (explicit) return explicit;
+  for (const value of allowedOrigins) {
+    const origin = dashboardOrigin(value);
+    if (origin) return origin;
+  }
+  return null;
+}
+
+/** A short, token-free slug for the calendar callback's `reason` parameter. */
+function googleCallbackReason(error: unknown): string {
+  const message = error instanceof Error ? error.message : "";
+  if (/expired/i.test(message)) return "expired";
+  if (/disconnect|changed/i.test(message)) return "changed";
+  if (/grant|permission|access|authoriz|authoris/i.test(message)) return "denied";
+  return "failed";
+}
+
 export async function createApp(
   db: Store,
   config: Config,
@@ -86,7 +118,18 @@ export async function createApp(
   });
   const browser = new BrowserService(db, config, auth, files);
   const computer = new ComputerService(db, config, options.docker);
-  agent = new AgentService(db, config, workspace, files, actions, browser, computer, undefined, undefined, google);
+  agent = new AgentService(
+    db,
+    config,
+    workspace,
+    files,
+    actions,
+    browser,
+    computer,
+    undefined,
+    undefined,
+    google,
+  );
   // Rich Threads are opt-in. Without a key the runtime runs native AG-UI:
   // chat streams and tools run, but conversations do not sync across devices.
   const intelligenceApiKey = config.intelligenceApiKey?.trim();
@@ -172,13 +215,38 @@ export async function createApp(
   // Public, session-free iCal feed. The token in the path is the credential.
   app.get("/api/calendar/feed/*", calendarFeedHandler(agent.calendar));
 
+  // The calendar consent lands the browser back on the dashboard with a visible
+  // result rather than on a server page. With no known dashboard origin (a bare
+  // API deployment) the honest server response is kept instead of a bogus
+  // redirect. The one-shot state is consumed exactly once either way.
+  const dashboardBase = calendarDashboardBase(config.allowedOrigins, config.publicAppUrl);
   app.get("/api/google/callback", async (c) => {
-    if (c.req.query("error"))
+    const back = (query: string) =>
+      dashboardBase ? c.redirect(`${dashboardBase}/calendar?${query}`, 302) : null;
+    if (c.req.query("error")) {
+      const redirect = back("google=error&reason=cancelled");
+      if (redirect) return redirect;
       return c.html("<h1>Google connection cancelled</h1><p>You can return to OpenPong.</p>", 400);
+    }
     const state = c.req.query("state"),
       code = c.req.query("code");
-    if (!state || !code) throw new AppError("Google callback is incomplete");
-    await google.callback(state, code);
+    if (!state || !code) {
+      const redirect = back("google=error&reason=incomplete");
+      if (redirect) return redirect;
+      throw new AppError("Google callback is incomplete");
+    }
+    try {
+      await google.callback(state, code);
+    } catch (error) {
+      if (!dashboardBase) throw error;
+      // A short reason only: never a token and never the raw Google error.
+      return c.redirect(
+        `${dashboardBase}/calendar?google=error&reason=${googleCallbackReason(error)}`,
+        302,
+      );
+    }
+    const redirect = back("google=connected");
+    if (redirect) return redirect;
     return c.html(
       "<h1>Google is connected</h1><p>Return to OpenPong and refresh your workspace.</p>",
     );
@@ -345,6 +413,44 @@ export async function createApp(
   app.post("/api/mail/import-attachment", async (c) => {
     const body = z.object({ reference: z.string() }).parse(await c.req.json());
     return c.json(await workspace.importAttachment(c.get("owner"), body.reference), 201);
+  });
+  /**
+   * What the dashboard's "Connect Google Calendar" button needs to be honest:
+   * whether this server can start a consent at all, and whether this owner has
+   * already connected. It never returns the client secret or any token.
+   */
+  app.get("/api/google/status", async (c) => {
+    const owner = c.get("owner");
+    const tokens = await google.tokens(owner).catch(() => null);
+    const record = await db.get<{ calendarId?: string }>(owner, "calendar", "google");
+    const calendars = tokens
+      ? await workspace
+          .calendars(owner)
+          .then((list) => list.length)
+          .catch(() => 0)
+      : 0;
+    return c.json({
+      configured: google.configured(),
+      connected: Boolean(tokens),
+      calendars,
+      ...(record?.calendarId ? { calendarId: record.calendarId } : {}),
+    });
+  });
+  /**
+   * The one-click calendar connect. Already connected is a no-op; otherwise the
+   * browser is handed Google's consent URL for exactly the three calendar
+   * scopes and nothing else. A server with no Google app says so plainly: the
+   * private iCal link still works and does not need Google.
+   */
+  app.post("/api/google/calendar/connect", async (c) => {
+    const owner = c.get("owner");
+    if (await google.tokens(owner).catch(() => null)) return c.json({ connected: true });
+    if (!google.configured())
+      throw new AppError(
+        "This server has no Google app configured. The private calendar link still works, and it does not need Google.",
+        503,
+      );
+    return c.json(await google.connectCalendar(owner));
   });
   app.post("/api/google/connect", async (c) => {
     const body = z.object({ capability: z.enum(["read", "write"]) }).parse(await c.req.json());
