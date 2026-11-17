@@ -35,7 +35,7 @@ class Companion:
         relay_base_url: str,
         pairing_token: str,
         chrome_port: int = 9222,
-        gate_ui_port: int = 8765,
+        gate_ui_port: int = 8766,
         launch_chrome_on_start: bool = True,
     ) -> None:
         self.relay_base_url = relay_base_url.rstrip("/")
@@ -291,7 +291,7 @@ def main() -> None:
     parser.add_argument("--relay-base-url", required=True, help="e.g. wss://relay.example")
     parser.add_argument("--pairing-token", "--register-token", dest="pairing_token", required=True)
     parser.add_argument("--chrome-port", type=int, default=9222)
-    parser.add_argument("--gate-ui-port", type=int, default=8765)
+    parser.add_argument("--gate-ui-port", type=int, default=8766)
     parser.add_argument("--no-launch-chrome", action="store_true",
                          help="Don't launch/reuse Chrome (assumes it's already up on --chrome-port)")
     parser.add_argument("-v", "--verbose", action="store_true")

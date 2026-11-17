@@ -29,12 +29,19 @@ interface RelayRequest {
 
 async function startRelay(
   t: TestContext,
-  options: { connected?: boolean; paired?: boolean; gates?: unknown[] } = {},
+  options: {
+    connected?: boolean;
+    paired?: boolean;
+    gates?: unknown[];
+    fingerprint?: string | null;
+  } = {},
 ) {
   const requests: RelayRequest[] = [];
   const connected = options.connected ?? true;
   const paired = options.paired ?? true;
   const gates = options.gates ?? [];
+  // The real relay sends `fingerprint: null` for an owner that has never paired.
+  const fingerprint = options.fingerprint === undefined ? "fp-1234" : options.fingerprint;
   const server: Server = createServer(async (request, response) => {
     let body = "";
     for await (const chunk of request) body += chunk;
@@ -58,7 +65,7 @@ async function startRelay(
         owner: record.owner,
         paired,
         connected,
-        fingerprint: "fp-1234",
+        fingerprint,
         gates,
       });
     }
@@ -214,6 +221,23 @@ test("companion status is owner-scoped and reports the relay's view", async (t) 
     false,
     "a client-supplied owner never reaches the relay",
   );
+});
+
+test("an owner who never paired is reported as unpaired, not as a broken relay", async (t) => {
+  // The live relay answers with `fingerprint: null`; that must read as
+  // "not paired yet", never as "Relay returned an unexpected response".
+  const relay = await startRelay(t, { connected: false, paired: false, fingerprint: null });
+  const { app } = await appFor(t, { relayUrl: relay.url, relayToken: "op-secret" });
+  const token = await sessionToken(app);
+  const response = await app.app.request("/api/agent/companion", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  assert.equal(response.status, 200, await response.clone().text());
+  const status = await response.json();
+  assert.equal(status.reachable, true);
+  assert.equal(status.paired, false);
+  assert.equal(status.connected, false);
+  assert.equal(status.error, undefined);
 });
 
 test("pairing returns a one-time command and DELETE unpairs", async (t) => {

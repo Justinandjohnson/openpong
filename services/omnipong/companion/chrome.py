@@ -62,9 +62,7 @@ def dedicated_profile_dir() -> str:
 
     Overridable via OPENPONG_CHROME_PROFILE_DIR for a custom location.
     """
-    override = os.environ.get("OPENPONG_CHROME_PROFILE_DIR") or os.environ.get(
-        "RUBBERR_CHROME_PROFILE_DIR"
-    )
+    override = os.environ.get("OPENPONG_CHROME_PROFILE_DIR")
     if override:
         return override
     system = platform.system()

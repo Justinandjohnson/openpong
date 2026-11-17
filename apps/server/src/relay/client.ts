@@ -37,7 +37,7 @@ export interface RelayCompanion {
   owner: string;
   paired: boolean;
   connected: boolean;
-  fingerprint?: string;
+  fingerprint?: string | null;
   gates: RelayGate[];
 }
 
@@ -45,7 +45,7 @@ export interface RelayPairing {
   owner: string;
   /** The pairing token — a secret, shown once so the person can paste it. */
   pairingToken: string;
-  fingerprint?: string;
+  fingerprint?: string | null;
   /** A copy-pasteable command to run on the person's own computer. */
   command: string;
   relayUrl: string;
@@ -70,14 +70,14 @@ const companionSchema = z.object({
   owner: z.string(),
   paired: z.boolean().default(false),
   connected: z.boolean().default(false),
-  fingerprint: z.string().optional(),
+  fingerprint: z.string().nullish(),
   gates: z.array(gateSchema).default([]),
 });
 
 const pairingSchema = z.object({
   owner: z.string(),
   pairing_token: z.string(),
-  fingerprint: z.string().optional(),
+  fingerprint: z.string().nullish(),
 });
 
 /** Convert an HTTP(S) relay base URL to the ws(s) URL the companion connects to. */

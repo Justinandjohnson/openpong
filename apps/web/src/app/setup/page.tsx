@@ -37,13 +37,6 @@ interface CalendarStatus {
   feedUrl?: string;
 }
 
-interface CompanionStatus {
-  reachable?: boolean;
-  paired?: boolean;
-  connected?: boolean;
-  gates?: unknown[];
-}
-
 interface DomainUser {
   full_name?: string;
   rating?: number;
@@ -100,7 +93,6 @@ export default function SetupPage() {
     null,
   );
   const [cal, setCal] = useState<CalendarStatus | null>(null);
-  const [comp, setComp] = useState<CompanionStatus | null>(null);
   const user = useOpenPong<DomainUser>("/user");
 
   const [leagueDraft, setLeagueDraft] = useState("");
@@ -136,10 +128,6 @@ export default function SetupPage() {
       .then((r) => (r.ok ? r.json() : null))
       .then((body) => alive && setCal(body))
       .catch(() => undefined);
-    fetch("/api/openpong/agent/companion", { cache: "no-store" })
-      .then((r) => (r.ok ? r.json() : null))
-      .then((body) => alive && setComp(body))
-      .catch(() => undefined);
     return () => {
       alive = false;
     };
@@ -159,7 +147,6 @@ export default function SetupPage() {
   const hasLeague = Boolean(current?.leagueUrls?.length);
   const calendarDone = Boolean(cal?.connected);
   const textsDone = Boolean(user.data?.phone_number);
-  const companionDone = Boolean(comp?.paired);
 
   const required = [
     Boolean(install?.installed),
@@ -427,25 +414,16 @@ export default function SetupPage() {
 
       <Step
         index={6}
-        title="Your computer"
-        description="Optional. Pair the OpenPong companion on your own computer and the coach can use the browser you are already signed in to — for sign-ups and pages that need a login. Nothing is stored on the server."
-        done={companionDone}
+        title="Browser"
+        description="Built in. The coach reads and acts on public pages in the app's own browser, and you can take over that same window whenever a page needs your login, 2FA or a captcha. Nothing to install."
+        done
         optional
       >
         <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
           <span className="flex items-center gap-1.5">
             <MonitorSmartphone className="size-3.5" />
-            {companionDone
-              ? comp?.connected
-                ? "Paired and connected"
-                : "Paired, waiting for the companion"
-              : comp?.reachable === false
-                ? "Relay not reachable on this server"
-                : "Not paired yet"}
+            Ready — no extension, no companion
           </span>
-          <Link href="/settings" className="font-bold text-accent underline">
-            Pair your computer
-          </Link>
         </div>
       </Step>
 

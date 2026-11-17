@@ -219,6 +219,9 @@ export class BrowserService {
       signal?.throwIfAborted();
       return {
         sessionId: id,
+        // Same value under the snake_case name the browser_act tool asks for, so
+        // a model reading this result cannot pair the two up wrongly.
+        session_id: id,
         ...page,
         text: page.text.slice(0, 30_000),
         truncated: page.truncated || page.text.length > 30_000,

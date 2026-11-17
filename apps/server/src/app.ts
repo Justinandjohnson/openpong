@@ -391,7 +391,7 @@ export async function createApp(
     await browser.get(c.get("owner"), c.req.param("id"));
     c.header(
       "Content-Security-Policy",
-      "default-src 'self'; img-src 'self' blob:; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'",
+      "default-src 'self'; img-src 'self' blob: data:; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'",
     );
     return c.html(browser.console(c.get("owner"), c.req.param("id")));
   });

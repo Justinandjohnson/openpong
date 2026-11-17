@@ -333,7 +333,7 @@ export async function createBrowserManager(
     input: (id: string, input: Record<string, unknown>) =>
       serial(id, async () => {
         const { page } = active(id);
-        const { type, x, y, key, text, deltaY } = input;
+        const { type, x, y, key, text, deltaY, action, selector, value } = input;
         if (
           type === "click" &&
           typeof x === "number" &&
@@ -363,7 +363,65 @@ export async function createBrowserManager(
           Math.abs(deltaY) <= 5000
         )
           await page.mouse.wheel(0, deltaY);
-        else throw new WorkerError("INVALID_INPUT", "Unsupported browser input or coordinates.");
+        else if (type === "act" && typeof action === "string") {
+          // Acting by what the page shows, so the agent never needs pixel vision.
+          // A visible label usually belongs to a link or a button, so try those
+          // roles first and only then fall back to any matching text.
+          const label = typeof text === "string" && text.trim() ? text.trim().slice(0, 200) : "";
+          const css =
+            typeof selector === "string" && selector.trim() ? selector.trim().slice(0, 500) : "";
+          if (!label && !css)
+            throw new WorkerError(
+              "INVALID_INPUT",
+              "Give the target as `text` (the visible label) or `selector` (CSS).",
+            );
+          const byRole = (role: "link" | "button" | "textbox" | "checkbox") =>
+            page.getByRole(role, { name: label, exact: false }).first();
+          const firstPresent = async (candidates: ReturnType<typeof page.locator>[]) => {
+            for (const candidate of candidates) {
+              if ((await candidate.count()) > 0) return candidate;
+            }
+            return null;
+          };
+          const clickTarget = async () => {
+            if (css) return page.locator(css).first();
+            return (
+              (await firstPresent([byRole("link"), byRole("button")])) ??
+              page.getByText(label, { exact: false }).first()
+            );
+          };
+          const fillTarget = async () => {
+            if (css) return page.locator(css).first();
+            return (
+              (await firstPresent([
+                page.getByLabel(label, { exact: false }),
+                page.getByPlaceholder(label, { exact: false }),
+                byRole("textbox"),
+              ])) ?? page.getByText(label, { exact: false }).first()
+            );
+          };
+          if (action === "click") {
+            const target = await clickTarget();
+            await target.scrollIntoViewIfNeeded({ timeout: 10_000 }).catch(() => undefined);
+            await target.click({ timeout: 15_000 });
+          } else if (action === "fill") {
+            if (typeof value !== "string" || value.length > 2000)
+              throw new WorkerError(
+                "INVALID_INPUT",
+                "fill needs a value of at most 2000 characters.",
+              );
+            await (await fillTarget()).fill(value, { timeout: 15_000 });
+          } else if (action === "submit") {
+            await (await fillTarget()).press("Enter", { timeout: 15_000 });
+          } else if (action === "text") {
+            const found = css
+              ? page.locator(css).first()
+              : page.getByText(label, { exact: false }).first();
+            await found.waitFor({ state: "visible", timeout: 15_000 });
+            const content = ((await found.textContent()) ?? "").trim().slice(0, 5000);
+            return { ...(await refresh(id)), text: content };
+          } else throw new WorkerError("INVALID_INPUT", "Unsupported browser action.");
+        } else throw new WorkerError("INVALID_INPUT", "Unsupported browser input or coordinates.");
         return refresh(id);
       }),
     downloads: async (id: string) => {

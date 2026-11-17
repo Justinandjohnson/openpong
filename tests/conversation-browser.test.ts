@@ -90,7 +90,7 @@ test("chat browse_web emits real SDK tool events and returns observed source con
   if (result.type !== EventType.TOOL_CALL_RESULT) throw new Error("Missing tool result");
   assert.equal(result.toolCallId, start.toolCallId);
   const page = JSON.parse(result.content);
-  assert.deepEqual(page, { sessionId: page.sessionId, ...observed });
+  assert.deepEqual(page, { sessionId: page.sessionId, session_id: page.sessionId, ...observed });
   assert.match(page.sessionId, /^[a-f0-9-]{36}$/);
   assert.deepEqual(fixture.browserCalls, ["/sessions", `/sessions/${page.sessionId}/read`]);
   assert.equal(events.at(-1)?.type, EventType.RUN_FINISHED);

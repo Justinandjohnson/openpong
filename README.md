@@ -51,7 +51,7 @@ same download works for someone in Ohio as it does for the first user in Texas.
 
 ### Trust model
 
-- **No third-party credentials are stored.** League data comes from public pages. Anything that needs your login (registration, private history) runs through your own browser via the relay + companion: the user logs in themselves and a human gate handles any login/2FA. With `OMNIPONG_BROWSER=relay`, no credential file is read at all — the legacy stored-credential path is opt-in only (`OMNIPONG_ALLOW_STORED_CREDENTIALS=true`). See `docs/RELAY_ARCHITECTURE.md`.
+- **No third-party credentials are stored, and nothing is installed.** The app ships its own browser. The coach reads and acts on public pages in that window; when a page needs your login, 2FA or a captcha, you take over the very same window from the app (a signed console page with a live view, tap-to-focus, typing and keys), then hand it back. League and tournament data come from public pages, so most of it needs no login at all. The legacy stored-credential path is opt-in only (`OMNIPONG_ALLOW_STORED_CREDENTIALS=true`) and never used by default.
 - **Signups are never silent.** The tool previews, the task waits for approval, and the receipt is saved.
 - **Read tools are read-only.** Chat cannot change your record through a query tool.
 - **Your bearer stays server-side.** The dashboard's BFF mints the session; the browser only holds an httpOnly cookie.

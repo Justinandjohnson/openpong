@@ -14,7 +14,6 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { AccountCard } from "@/components/account-card";
-import { CompanionCard } from "@/components/companion-card";
 import { SmsCard } from "@/components/sms-card";
 import { Badge } from "@/components/ui/badge";
 import { buttonClassName } from "@/components/ui/button";
@@ -156,8 +155,8 @@ export default function SettingsPage() {
             },
             {
               icon: Shield,
-              label: "Browser worker",
-              value: health.data?.server?.browserConfigured ? "Configured" : "Not configured",
+              label: "Browser (built in)",
+              value: health.data?.server?.browserConfigured ? "Ready" : "Unavailable",
               ok: Boolean(health.data?.server?.browserConfigured),
             },
           ].map(({ icon: Icon, label, value, ok }) => (
@@ -178,7 +177,6 @@ export default function SettingsPage() {
         </CardContent>
       </Card>
 
-      <CompanionCard />
 
       <Card>
         <CardHeader>
@@ -196,10 +194,9 @@ export default function SettingsPage() {
             never sees it.
           </p>
           <p>
-            USATT / Stadium access runs through your own logged-in browser via the OmniPong relay
-            and companion, with a human gate whenever a login is needed. With relay mode on, no
-            credential is stored anywhere — the relay only forwards browser bytes, and the dashboard
-            shows which of your computers is paired.
+            The browser is built into the app. The coach reads and acts on public pages in its own
+            window, and you take over that same window whenever a page needs your login, 2FA or a
+            captcha. Nothing is installed on your machine and no site password is ever stored.
           </p>
           <div className="flex flex-wrap gap-2">
             <Badge variant="success">No passwords stored</Badge>

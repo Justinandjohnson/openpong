@@ -326,8 +326,10 @@ class RelayBrowserManager:
     async def stop(self):
         try:
             if self.context:
-                await self.context.close()
-        finally:
+                try:
+                    await self.context.close()
+                except Exception:  # noqa: BLE001 - CDP may already be gone
+                    pass
             if self.browser:
                 try:
                     await self.browser.close()
@@ -338,6 +340,10 @@ class RelayBrowserManager:
             if self.session_token:
                 await stop_relay_session(self.relay, self.session_token)
                 self.session_token = None
+        finally:
+            self.context = None
+            self.browser = None
+            self.pw = None
 
 
 def create_browser_manager():

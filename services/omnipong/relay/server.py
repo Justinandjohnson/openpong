@@ -182,7 +182,7 @@ async def session_start(request: Request) -> JSONResponse:
     _require_operator_token(request)
     body = await request.json()
     pairing_token = body.get("pairing_token") or body.get("register_token")
-    owner_claim = body.get("owner")
+    owner_claim = (body.get("owner") or "").strip() or None
     takeover = bool(request.query_params.get("takeover") == "true" or body.get("takeover"))
 
     # §2.3: the effective owner comes from the pairing token, or (for the

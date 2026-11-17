@@ -9,7 +9,6 @@ from typing import Literal
 from xml.sax.saxutils import escape
 
 import anthropic
-import httpx
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware

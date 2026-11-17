@@ -175,7 +175,9 @@ def build_mock_relay_app(results: dict, chrome_port: int, gate_ui_port: int, mod
                             await asyncio.sleep(0.25)
                     if page_html is None:
                         raise CheckFailed("companion's gate UI never came up on GATE_OPEN")
-                    nonce_match = re.search(r"X-Gate-Nonce':'([^']+)'", page_html)
+                    nonce_match = re.search(r"X-Gate-Nonce':'([^']+)'", page_html) or re.search(
+                        r'NONCE\s*=\s*"([^"]+)"', page_html
+                    )
                     if not nonce_match:
                         raise CheckFailed("gate UI page did not embed an X-Gate-Nonce")
                     async with client.post(
@@ -250,3 +252,38 @@ async def test_companion_full_round_trip_when_user_clicks_continue():
 
 async def test_companion_gate_cleared_by_relay_dashboard_action():
     await _run_selftest("relay_clears")
+
+
+async def test_gate_ui_falls_back_to_a_free_port_when_the_preferred_one_is_taken(monkeypatch):
+    """The relay listens on 8765 by default, so the gate prompt must not die
+    just because its preferred port is already in use."""
+    import socket
+    import threading
+    import urllib.request
+
+    import gate_ui as gate_ui_module
+
+    blocker = socket.socket()
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen(1)
+    taken_port = blocker.getsockname()[1]
+
+    opened: list[str] = []
+    monkeypatch.setattr(gate_ui_module.webbrowser, "open", lambda url: opened.append(url))
+
+    ui = gate_ui_module.GateUI(port=taken_port)
+    try:
+        ui.open("g_1", "login", "Log in on the mock site, then continue.", "example.com", lambda: None)
+        assert opened, "the prompt was never opened"
+        url = opened[0]
+        assert f":{taken_port}/" not in url, "must not reuse the occupied port"
+        with urllib.request.urlopen(url + "ping", timeout=5) as response:
+            assert response.status == 200
+            assert b'"ok"' in response.read()
+        with urllib.request.urlopen(url, timeout=5) as response:
+            page = response.read().decode()
+        assert "Continue" in page
+        assert "NONCE" in page
+    finally:
+        ui.close()
+        blocker.close()

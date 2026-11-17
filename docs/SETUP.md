@@ -74,14 +74,18 @@ Type your mobile number and press **Save number**, then **Send a test text**.
 Texts you send back are answered by **rule** — `MATCHES`, `TOURNAMENTS`, `RATING`, `SYNC`, `HELP` —
 never by the language model, so a stray text can never spend your model credits.
 
-### 6. Your computer (optional)
+### 6. Browser
 
-Pair the OpenPong companion on a computer you are already signed in on, and the coach can use *that*
-browser for pages that need a login (tournament sign-ups, Cloudflare-protected pages). Nothing is
-stored on the server; when a login or captcha appears, the agent pauses and a small local page tells
-you to finish it in your own Chrome tab, then click **Continue**.
+Nothing to do — it is built in. The app starts its own browser with the server, so the coach can read
+and act on public pages immediately: "open this tournament page and tell me the divisions", "click
+the event I want and read the entry fee".
 
-Open **Settings → Your computer** to see the state and pair it.
+When a page needs *your* login, 2FA or a captcha, you take over the same window: the app shows a live
+view of that browser with tap-to-focus, a text box, Enter/Tab/Delete and scrolling. Finish the login
+there, tell the coach to continue, and it carries on in the same session. No extension, no companion,
+nothing installed on your machine — and no site password is ever stored.
+
+**Settings → Connections** shows *Browser (built in) → Ready* when it is up.
 
 ---
 

@@ -14,3 +14,9 @@ artifacts/
 
 # local demo database (never committed)
 .demo/
+
+# relay pairing tokens (secrets) and the relay's own venv
+services/omnipong/relay/pairings.json
+services/omnipong/relay/register_tokens.json
+services/omnipong/relay/.venv/
+services/omnipong/companion/.venv/
