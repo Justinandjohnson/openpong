@@ -13,6 +13,12 @@ export interface GoogleCalendarStatus {
   calendars: number;
   /** The Pong calendar's id, once it exists. */
   calendarId?: string;
+  /**
+   * A connection exists but Google no longer honours it — a revoked grant, or
+   * an app still in Testing where refresh tokens last seven days. The person
+   * needs to reconnect; anything else looks like a calendar that silently broke.
+   */
+  needsReconnect?: boolean;
 }
 
 /** The operator guide, served from the repository's own docs file. */

@@ -209,3 +209,53 @@ test("without a dashboard origin the callback keeps a server response", async (t
   const body = (await response.json()) as { error: string };
   assert.match(body.error, /expired|incomplete/i);
 });
+
+/** Seed a Google connection without going through a consent. */
+async function seedConnection(f: Awaited<ReturnType<typeof fixture>>, expiresAt: number) {
+  assert.ok(f.config.encryptionKey);
+  await f.db.put("local-user", "credentials", {
+    id: "google",
+    connectionId: "seeded-connection",
+    secret: encryptSecret(
+      JSON.stringify({
+        connectionId: "seeded-connection",
+        accessToken: "synthetic-access",
+        refreshToken: "synthetic-refresh",
+        expiresAt,
+        scopes: [CALENDAR_SCOPES[2]],
+        account: "player@example.com",
+      }),
+      f.config.encryptionKey,
+    ),
+  });
+}
+
+test("a live connection reports connected", async (t) => {
+  const f = await fixture(t, { ...GOOGLE });
+  await seedConnection(f, Date.now() + 3_600_000);
+  const { token } = await f.auth.session();
+  const response = await f.app.request("/api/google/status", { headers: bearer(token) });
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as { connected: boolean; needsReconnect?: boolean };
+  assert.equal(body.connected, true);
+  assert.equal(body.needsReconnect, undefined);
+});
+
+test("a connection whose token no longer works says reconnect, not connected", async (t) => {
+  const f = await fixture(t, { ...GOOGLE });
+  // Expired access token and a refresh grant Google now rejects: exactly what a
+  // Testing-status app does to everyone on day eight.
+  await seedConnection(f, Date.now() - 1_000);
+  t.mock.method(globalThis, "fetch", async () => new Response("{}", { status: 401 }));
+  const { token } = await f.auth.session();
+  const response = await f.app.request("/api/google/status", { headers: bearer(token) });
+  assert.equal(response.status, 200);
+  const body = (await response.json()) as {
+    connected: boolean;
+    needsReconnect?: boolean;
+    calendars: number;
+  };
+  assert.equal(body.connected, false);
+  assert.equal(body.needsReconnect, true);
+  assert.equal(body.calendars, 0);
+});

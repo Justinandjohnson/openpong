@@ -92,6 +92,34 @@ Until the app is published (Lane B), Google caps it:
 For a quick demo that is fine. For anyone outside the test-user list, publish
 the app.
 
+The app never lies about this. Once a week, when the refresh token dies, `/calendar`
+stops saying "Connected" and says **"Google expired this connection"** with a
+one-click Reconnect, because a green badge over a dead token is the fastest way
+to convince someone their calendar is broken.
+
+---
+
+## What a brand-new person sees
+
+Three situations, three amounts of work. Pick the lane once, and every person who
+installs the build gets that experience.
+
+| The person | Their setup | Clicks |
+| --- | --- | --- |
+| Uses a build whose author published the app (Lane B) | Install → open → **Connect Google Calendar** → Allow | **2** |
+| Self-hosts and creates their own client (Lane A) | Cloud Console once (~10 min), then Connect → Allow | 6 once, then 2 |
+| Self-hosts and skips Google entirely | Paste the private iCal feed into Apple/Google Calendar | 2, write-only |
+
+After Google is connected, nothing else is needed: the **Pong** calendar is
+created automatically, and tournaments, sign-ups, league nights and results sync
+into it with one button.
+
+The wizard at `/setup` covers the rest — name and area, league, calendar, text
+alerts, your AI key, and the browser — and every step is skippable. A person who
+skips Google still gets the coach, the league data and the iCal feed; the only
+thing they lose is the coach *reading* their schedule, which a write-only feed
+cannot support.
+
 ---
 
 ## Lane B — publish it (what makes it one click for anyone)

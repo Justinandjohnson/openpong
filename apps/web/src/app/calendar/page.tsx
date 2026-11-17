@@ -550,6 +550,12 @@ export default function CalendarPage() {
             </div>
           ) : !google.connected ? (
             <div className="flex flex-col gap-2 rounded-xl border border-border bg-background/40 p-3">
+              {google.needsReconnect && (
+                <p className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-[11px] leading-relaxed">
+                  <span className="font-bold">Google expired this connection.</span> Unverified
+                  Google apps expire access after seven days. One click reconnects it.
+                </p>
+              )}
               <p className="text-[11px] leading-relaxed text-muted-foreground">
                 Connect Google once so the coach can read the calendars you choose as context and
                 keep the Pong calendar current. It never reads your mail and never changes events on

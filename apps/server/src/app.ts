@@ -423,7 +423,18 @@ export async function createApp(
     const owner = c.get("owner");
     const tokens = await google.tokens(owner).catch(() => null);
     const record = await db.get<{ calendarId?: string }>(owner, "calendar", "google");
-    const calendars = tokens
+    // A stored refresh token can die — a Google app still in "Testing" expires
+    // them after seven days, and a revoked grant dies at once. A "Connected"
+    // badge over a dead token is the fastest way to make someone think their
+    // calendar is broken, so ask for a live token. That is cached for an hour,
+    // so this costs at most one Google round trip per hour.
+    const live = tokens
+      ? await google
+          .accessToken(owner)
+          .then(() => true)
+          .catch(() => false)
+      : false;
+    const calendars = live
       ? await workspace
           .calendars(owner)
           .then((list) => list.length)
@@ -431,7 +442,8 @@ export async function createApp(
       : 0;
     return c.json({
       configured: google.configured(),
-      connected: Boolean(tokens),
+      connected: live,
+      ...(tokens && !live ? { needsReconnect: true } : {}),
       calendars,
       ...(record?.calendarId ? { calendarId: record.calendarId } : {}),
     });
