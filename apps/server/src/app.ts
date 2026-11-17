@@ -36,6 +36,7 @@ import { AgentService } from "./engine/service.ts";
 import { AppError } from "./errors.ts";
 import { Files } from "./files.ts";
 import { GoogleAuth } from "./google-auth.ts";
+import { dashboardOrigin, GoogleIdentity } from "./google-identity.ts";
 import { rateLimit } from "./rate-limit.ts";
 import { WorkspaceService } from "./workspace.ts";
 
@@ -51,6 +52,7 @@ export async function createApp(
     workspace = new WorkspaceService(db, config, files, google);
   const multiTenant = multiTenantEnabled();
   const accounts = new AccountService(db, config);
+  const identity = new GoogleIdentity(config, auth, accounts);
   const requestContext = (c: Context): RequestContext => {
     let address: string | undefined;
     try {
@@ -183,8 +185,14 @@ export async function createApp(
   });
   app.use("/api/*", async (c, next) => {
     // Account routes authenticate themselves: signup/login are public, and the
-    // others return their own 401 (and Retry-After) shapes.
-    if (multiTenant && c.req.path.startsWith("/api/auth/")) return next();
+    // others return their own 401 (and Retry-After) shapes. Google sign-in is
+    // public even when accounts are off, so it can answer with a clear 403
+    // rather than the bearer gate's 401.
+    if (
+      c.req.path.startsWith("/api/auth/google/") ||
+      (multiTenant && c.req.path.startsWith("/api/auth/"))
+    )
+      return next();
     // A signed URL grants only the requests its page makes: reads, and the console's input.
     const method = c.req.method === "HEAD" ? "GET" : c.req.method;
     const signedRoute =
@@ -422,14 +430,14 @@ export async function createApp(
   );
   // Multi-tenant account routes. Appended last so the single-owner routes above
   // (and their order) stay untouched; they are only mounted when enabled.
+  /** Seed the account's own workspace, then mint a session owned by its id. */
+  const beginAccountSession = async (account: Account, context: RequestContext) => {
+    await workspace.ensureSample(account.id, actions);
+    await agent.ensure(account.id);
+    const session = await auth.sessionFor(account.id, context);
+    return session.token;
+  };
   if (multiTenant) {
-    /** Seed the account's own workspace, then mint a session owned by its id. */
-    const beginAccountSession = async (account: Account, context: RequestContext) => {
-      await workspace.ensureSample(account.id, actions);
-      await agent.ensure(account.id);
-      const session = await auth.sessionFor(account.id, context);
-      return session.token;
-    };
     app.post("/api/auth/signup", async (c) => {
       const body = z
         .object({
@@ -484,5 +492,46 @@ export async function createApp(
       return c.json({ ok: true });
     });
   }
+  // Google sign-in, identity only (`openid email profile`). It never requests a
+  // calendar or Gmail scope, and the calendar connect flow above is untouched.
+  // Mounted even when accounts are off so `start` can answer with a clear 403.
+  app.post("/api/auth/google/start", async (c) => {
+    if (!multiTenant)
+      throw new AppError("Accounts are not enabled on this server. Sign-in is unavailable.", 403);
+    const body = z.object({ redirectBase: z.string() }).parse(await c.req.json());
+    return c.json(identity.start(body.redirectBase));
+  });
+  app.get("/api/auth/google/callback", async (c) => {
+    const state = identity.state(c.req.query("state"));
+    const base = state ? dashboardOrigin(state.redirectBase) : null;
+    // A valid state tells us where the dashboard lives; without one there is no
+    // safe place to send the browser, so the error stays on the server.
+    const fail = (message: string) =>
+      base
+        ? c.redirect(`${base}/login?error=${encodeURIComponent(message)}`, 302)
+        : c.json({ error: message }, 400);
+    if (c.req.query("error")) return fail("Google sign-in was cancelled.");
+    const code = c.req.query("code");
+    if (!code || !state || !base) return fail("Google sign-in could not be verified.");
+    if (state.expiresAt < Date.now()) return fail("Google sign-in expired. Try again.");
+    try {
+      const account = await identity.complete(code, requestContext(c));
+      const oneTime = identity.issueCode(account.id);
+      return c.redirect(`${base}/login/google?code=${encodeURIComponent(oneTime)}`, 302);
+    } catch (error) {
+      return fail(error instanceof AppError ? error.message : "Google sign-in failed. Try again.");
+    }
+  });
+  app.post("/api/auth/google/exchange", async (c) => {
+    if (!multiTenant)
+      throw new AppError("Accounts are not enabled on this server. Sign-in is unavailable.", 403);
+    const body = z.object({ code: z.string() }).parse(await c.req.json());
+    const accountId = identity.redeemCode(body.code);
+    if (!accountId) throw new AppError("This sign-in link is no longer valid. Try again.", 401);
+    const account = await accounts.get(accountId);
+    if (!account) throw new AppError("Account not found. Sign in again.", 401);
+    const token = await beginAccountSession(account, requestContext(c));
+    return c.json({ token, account });
+  });
   return { app, auth, files, actions, workspace, agent, computer };
 }

@@ -121,6 +121,31 @@ export class Auth {
     if (authorization?.startsWith("Bearer "))
       await this.db.remove("system", "sessions", digest(authorization.slice(7)).toString("hex"));
   }
+  /**
+   * Stateless signed payload for an OAuth round-trip (the Google sign-in state).
+   * It reuses the document-link HMAC key; the body is opaque and self-expiring
+   * because the caller embeds `expiresAt` in it.
+   */
+  signPayload(payload: Record<string, unknown>): string {
+    const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+    const signature = createHmac("sha256", this.signingKey).update(body).digest("base64url");
+    return `${body}.${signature}`;
+  }
+  /** Decode a payload from `signPayload`; null when the signature is missing or wrong. */
+  verifyPayload<T>(token: string): T | null {
+    const [body, signature] = token.split(".");
+    if (!body || !signature) return null;
+    const expected = Buffer.from(
+      createHmac("sha256", this.signingKey).update(body).digest("base64url"),
+    );
+    const actual = Buffer.from(signature);
+    if (expected.length !== actual.length || !timingSafeEqual(expected, actual)) return null;
+    try {
+      return JSON.parse(Buffer.from(body, "base64url").toString("utf8")) as T;
+    } catch {
+      return null;
+    }
+  }
   sign(owner: string, path: string) {
     const expires = String(Date.now() + 15 * 60 * 1000);
     const signature = createHmac("sha256", this.signingKey)

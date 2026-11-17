@@ -177,6 +177,35 @@ export class OmniPongService {
     return this.runAction("search", { name });
   }
 
+  /**
+   * `POST /tools/search/players` — the local players table (no login, no
+   * scraping, no owner gate). This is the reliable candidate source for
+   * "find me by name": the service's own `search` action needs a live scrape
+   * and its USATT lookup is owner-gated, so neither can be relied on for a
+   * brand-new install.
+   */
+  async searchLocalPlayers(name: string): Promise<unknown> {
+    const trimmed = name.trim();
+    if (!trimmed) throw new OmniPongError("A player name is required.");
+    return this.request("/tools/search/players", objectSchema, {
+      method: "POST",
+      body: { name: trimmed },
+    });
+  }
+
+  /**
+   * `GET /tools/lookup/usatt` — the vendored service's public USATT lookup
+   * (no login). Returns `{status, player, rating_history, tournaments}` or a
+   * `not_found` status; a private/blocked lookup is a clean `OmniPongError`.
+   */
+  async lookupUsatt(name: string): Promise<Record<string, unknown>> {
+    const trimmed = name.trim();
+    if (!trimmed) throw new OmniPongError("A player name is required.");
+    return this.request(this.withQuery("/tools/lookup/usatt", { name: trimmed }), objectSchema, {
+      timeoutMs: 45_000,
+    });
+  }
+
   /** `GET /players/{name}/scouting` — an AI scouting report for one opponent. */
   async getScouting(name: string): Promise<Record<string, unknown>> {
     return this.request(`/players/${encodeURIComponent(name)}/scouting`, objectSchema);

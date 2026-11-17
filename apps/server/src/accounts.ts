@@ -29,7 +29,14 @@ export interface RequestContext {
   userAgent?: string;
 }
 
-export type AuditEvent = "signup" | "login" | "login_failed" | "password_change" | "logout";
+export type AuditEvent =
+  | "signup"
+  | "login"
+  | "login_failed"
+  | "password_change"
+  | "logout"
+  | "google_signup"
+  | "google_login";
 
 const SCRYPT_N = 2 ** 15;
 const SCRYPT_R = 8;
@@ -266,6 +273,44 @@ export class AccountService {
     });
     await recordAudit(this.db, record.id, "signup", { ...context, email: record.email });
     return publicAccount(record);
+  }
+
+  /**
+   * Find an account by email, creating one when this OAuth user is new. An OAuth
+   * account has no password: the empty hash can never match a scrypt credential,
+   * so the password login path stays closed to it. Concurrency is settled by the
+   * same atomic insert `signup` uses; a lost race returns the winner's row.
+   */
+  async findOrCreateByEmail(
+    email: string,
+    displayName?: string,
+  ): Promise<{ account: Account; created: boolean }> {
+    const normalizedEmail = assertEmail(email);
+    const existing = await this.find(normalizedEmail);
+    if (existing) return { account: publicAccount(existing), created: false };
+    if (displayName !== undefined && typeof displayName !== "string")
+      throw new AppError("Display name must be text");
+    const name = clip(displayName, DISPLAY_NAME_MAX) ?? normalizedEmail.split("@")[0];
+    const record: AccountRecord = {
+      id: randomUUID(),
+      email: normalizedEmail,
+      displayName: name,
+      passwordHash: "",
+      createdAt: new Date().toISOString(),
+    };
+    const inserted = await this.db.insertIfAbsentAt(
+      ACCOUNT_SCOPE,
+      ACCOUNT_KIND,
+      normalizedEmail,
+      record,
+    );
+    if (!inserted) {
+      const winner = await this.find(normalizedEmail);
+      if (!winner) throw new AppError("Could not create the account. Try again.", 503);
+      return { account: publicAccount(winner), created: false };
+    }
+    await this.db.put(ACCOUNT_SCOPE, ACCOUNT_ID_KIND, { id: record.id, email: record.email });
+    return { account: publicAccount(record), created: true };
   }
 
   async login(email: string, password: string, context: RequestContext = {}): Promise<Account> {

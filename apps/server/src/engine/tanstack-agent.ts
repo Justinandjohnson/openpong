@@ -13,52 +13,100 @@ import {
   type SchemaInput,
   toolDefinition,
 } from "@tanstack/ai";
-import { type AnthropicChatModel, anthropicText } from "@tanstack/ai-anthropic";
-import { type GeminiTextModel, geminiText } from "@tanstack/ai-gemini";
-import { type OpenAIChatModel, openaiChatCompletions, openaiText } from "@tanstack/ai-openai";
+import {
+  type AnthropicChatModel,
+  anthropicText,
+  createAnthropicChat,
+} from "@tanstack/ai-anthropic";
+import { createGeminiChat, type GeminiTextModel, geminiText } from "@tanstack/ai-gemini";
+import {
+  createOpenaiChat,
+  createOpenaiChatCompletions,
+  type OpenAIChatModel,
+  openaiChatCompletions,
+  openaiText,
+} from "@tanstack/ai-openai";
 import { map, mergeMap, type Observable } from "rxjs";
 import { z } from "zod";
 import { MODEL_MAX_RETRIES } from "../config.ts";
 
+/**
+ * Per-owner auth for a model turn. When a bring-your-own-key owner has pasted
+ * their own key, these values win over the host environment for their chat only:
+ * the key, the provider's own endpoint, and the wire format all come from the
+ * owner's provider instead of the host's. Absent entirely, adapter() behaves
+ * exactly as before and reads the host environment.
+ */
+export interface AdapterAuth {
+  apiKey?: string;
+  baseUrl?: string;
+  chatCompletions?: boolean;
+}
+
+function explicitKey(auth?: AdapterAuth): string | undefined {
+  const key = auth?.apiKey?.trim();
+  return key ? key : undefined;
+}
+
 // Same "provider/model" strings, env vars and base URL formats as the AI SDK resolver in
 // @copilotkit/runtime. Each provider SDK retries transient failures up to MODEL_MAX_RETRIES times.
-function adapter(spec: string) {
+export function adapter(spec: string, auth?: AdapterAuth) {
   const [, provider = "", model = ""] = spec.trim().match(/^([^/:]*)[/:](.*)$/) ?? [];
   if (!provider || !model.trim())
     throw new Error(
       `Invalid model string "${spec}". Use "openai/gpt-5", "anthropic/claude-sonnet-4.5", or "google/gemini-2.5-pro".`,
     );
   const id = model.trim();
+  const apiKey = explicitKey(auth);
   switch (provider.toLowerCase()) {
-    case "openai":
+    case "openai": {
       // OpenAI-compatible endpoints that do not implement the Responses API
       // tool loop (e.g. DeepSeek) can opt into the Chat Completions wire format.
-      if (process.env.OPENAI_CHAT_COMPLETIONS === "true")
-        return openaiChatCompletions(id as OpenAIChatModel, {
-          baseURL: process.env.OPENAI_BASE_URL,
-          maxRetries: MODEL_MAX_RETRIES,
-        });
-      return openaiText(id as OpenAIChatModel, {
-        baseURL: process.env.OPENAI_BASE_URL,
-        maxRetries: MODEL_MAX_RETRIES,
-      });
-    case "anthropic":
+      const chatFormat = auth?.chatCompletions ?? process.env.OPENAI_CHAT_COMPLETIONS === "true";
+      const baseURL = auth?.baseUrl ?? process.env.OPENAI_BASE_URL;
+      if (chatFormat)
+        return apiKey
+          ? createOpenaiChatCompletions(id as OpenAIChatModel, apiKey, {
+              baseURL,
+              maxRetries: MODEL_MAX_RETRIES,
+            })
+          : openaiChatCompletions(id as OpenAIChatModel, {
+              baseURL,
+              maxRetries: MODEL_MAX_RETRIES,
+            });
+      return apiKey
+        ? createOpenaiChat(id as OpenAIChatModel, apiKey, {
+            baseURL,
+            maxRetries: MODEL_MAX_RETRIES,
+          })
+        : openaiText(id as OpenAIChatModel, { baseURL, maxRetries: MODEL_MAX_RETRIES });
+    }
+    case "anthropic": {
       // The AI SDK base URL ends in /v1; the Anthropic SDK adds /v1 itself.
-      return anthropicText(id as AnthropicChatModel, {
-        baseURL: process.env.ANTHROPIC_BASE_URL?.replace(/\/v1\/?$/, ""),
-        maxRetries: MODEL_MAX_RETRIES,
-      });
+      const baseURL = (auth?.baseUrl ?? process.env.ANTHROPIC_BASE_URL)?.replace(/\/v1\/?$/, "");
+      return apiKey
+        ? createAnthropicChat(id as AnthropicChatModel, apiKey, {
+            baseURL,
+            maxRetries: MODEL_MAX_RETRIES,
+          })
+        : anthropicText(id as AnthropicChatModel, { baseURL, maxRetries: MODEL_MAX_RETRIES });
+    }
     case "google":
     case "gemini":
-    case "google-gemini":
+    case "google-gemini": {
       // The AI SDK base URL ends in /v1beta; @google/genai adds the API version itself.
-      return geminiText(id as GeminiTextModel, {
-        httpOptions: {
-          baseUrl: process.env.GOOGLE_GENERATIVE_AI_BASE_URL?.replace(/\/v1beta\/?$/, ""),
-          // @google/genai counts the first call in `attempts`.
-          retryOptions: { attempts: MODEL_MAX_RETRIES + 1 },
-        },
-      });
+      const httpOptions = {
+        baseUrl: (auth?.baseUrl ?? process.env.GOOGLE_GENERATIVE_AI_BASE_URL)?.replace(
+          /\/v1beta\/?$/,
+          "",
+        ),
+        // @google/genai counts the first call in `attempts`.
+        retryOptions: { attempts: MODEL_MAX_RETRIES + 1 },
+      };
+      return apiKey
+        ? createGeminiChat(id as GeminiTextModel, apiKey, { httpOptions })
+        : geminiText(id as GeminiTextModel, { httpOptions });
+    }
     default:
       throw unknownProvider(provider, spec);
   }
@@ -116,6 +164,8 @@ export function tanstackAgent(options: {
   maxSteps: number;
   tools: ToolDefinition[];
   prompt: string;
+  /** Per-owner BYOK auth; absent means the host environment applies. */
+  modelAuth?: AdapterAuth;
   /** Checked between model turns, after the current turn's tools have settled. */
   shouldContinue?: () => boolean;
   /** Said when the step limit, not the model, ends a run; otherwise the reply just stops. */
@@ -138,7 +188,7 @@ export function tanstackAgent(options: {
       )
         system += `\n## Application State\nThis is state from the application that you can edit by calling AGUISendStateSnapshot or AGUISendStateDelta.\n\`\`\`json\n${JSON.stringify(input.state, null, 2)}\n\`\`\`\n`;
       return chat({
-        adapter: adapter(options.model),
+        adapter: adapter(options.model, options.modelAuth),
         messages: converted.messages,
         systemPrompts: system ? [system] : [],
         tools: [

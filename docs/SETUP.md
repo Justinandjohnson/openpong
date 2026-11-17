@@ -111,20 +111,30 @@ pnpm dev:dashboard
 `docs/DEPLOY.md` covers the same thing for a VPS, Docker Compose and a managed split (Render
 blueprint, or Cloudflare for the read-only demos).
 
-### Google Calendar (enables the one-button *Connect Google*)
+### Google Calendar and Google sign-in (optional, both off by default)
+
+**Nothing here is required.** Calendar already works with no Google account at all: the wizard
+step hands out a private `webcal://` link you subscribe to once. Add a Google client only if you
+want the one-button *Connect Google* calendar, or a **Continue with Google** button on the sign-in
+screen.
+
+Both use the same OAuth client:
 
 1. In [Google Cloud Console](https://console.cloud.google.com/), create (or pick) a project.
-2. **APIs & Services → Library → Google Calendar API → Enable.**
-3. **OAuth consent screen:** type External, add yourself under **Test users** (a test-mode app needs
-   no verification for personal use).
+2. **APIs & Services → Library → Google Calendar API → Enable** (only needed for the calendar).
+3. **OAuth consent screen:** type External, then **Publish app**. Basic identity scopes
+   (`openid email profile`) need no verification and work for any number of people; publishing
+   also stops the 7-day token expiry you get in Testing.
 4. **Credentials → Create credentials → OAuth client ID → Web application.**
-   Authorised redirect URI, exactly:
+   Authorised redirect URIs — add **both**:
 
    ```
    http://localhost:8787/api/google/callback
+   http://localhost:8787/api/auth/google/callback
    ```
 
-   Add your production URL's equivalent later (`https://your-host/api/google/callback`).
+   The first is the calendar, the second is sign-in. Add your production URL's equivalents later
+   (`https://your-host/api/google/callback`, `https://your-host/api/auth/google/callback`).
 5. Put the client ID and secret in `.env` and restart the agent server:
 
    ```bash
@@ -132,8 +142,14 @@ blueprint, or Cloudflare for the read-only demos).
    GOOGLE_CLIENT_SECRET=...
    ```
 
-Now step 4 of the wizard offers the Google path. OpenPong requests
-`calendar.app.created` (+ `calendarlist.readonly`) and creates the **Pong** calendar itself.
+Then step 4 of the wizard offers the Google path, and the sign-in screen shows
+**Continue with Google**. Until a client is configured the button is simply absent — a dead
+button would only confuse people. OpenPong requests `calendar.app.created` (+
+`calendarlist.readonly`) for the calendar and `openid email profile` for sign-in; it creates the
+**Pong** calendar itself and never asks for Gmail.
+
+Note the calendar scopes are *sensitive* to Google: for a public deployment with more than 100
+users, Google requires a review (domain, privacy policy and a demo video). Identity scopes do not.
 
 ### Twilio texts
 

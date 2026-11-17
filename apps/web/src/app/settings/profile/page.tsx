@@ -3,6 +3,7 @@
 import { CheckCircle2, Loader2, MapPin, Trophy, User } from "lucide-react";
 import Link from "next/link";
 import { useEffect, useState } from "react";
+import { FindPlayer, type PlayerCandidate } from "@/components/find-player";
 import { Badge } from "@/components/ui/badge";
 import { Button, buttonClassName } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -180,6 +181,31 @@ export default function ProfilePage() {
     setSaved(null);
   };
 
+  // Filling a chosen candidate sets the name and USATT number, and — when the
+  // public result carries them — the state and club. We never invent a region or
+  // city the search did not provide.
+  function applyCandidate(candidate: PlayerCandidate) {
+    setDraft((current) => {
+      const withValue = (text: string, value: string) => {
+        const existing = splitList(text);
+        if (existing.some((item) => item.toLowerCase() === value.toLowerCase())) return text;
+        return [...existing, value].join(", ");
+      };
+      const states = candidate.state ? withValue(current.states, candidate.state) : current.states;
+      const clubs = candidate.club ? withValue(current.clubs, candidate.club) : current.clubs;
+      const homeRegion = current.homeRegion || candidate.homeRegion || candidate.region || "";
+      return {
+        ...current,
+        displayName: candidate.name,
+        usattId: candidate.usattId ?? current.usattId,
+        homeRegion,
+        states,
+        clubs,
+      };
+    });
+    setSaved(null);
+  }
+
   async function save() {
     if (!draft.displayName.trim()) {
       setError("Your name is the one thing the profile needs.");
@@ -248,6 +274,17 @@ export default function ProfilePage() {
                 onChange={set("usattId")}
                 placeholder="e.g. 1234567"
               />
+            </div>
+
+            <div className="rounded-xl border border-border bg-background/40 p-3">
+              <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-muted-foreground">
+                Give your name, and we'll find you
+              </p>
+              <p className="mt-1 mb-2 text-[11px] leading-snug text-muted-foreground">
+                Search the public results, then pick the person who is you. It fills your name,
+                USATT number and state below — you can change anything before saving.
+              </p>
+              <FindPlayer initialName={draft.displayName} onPick={applyCandidate} />
             </div>
 
             <div className="flex items-center gap-2 pt-1">

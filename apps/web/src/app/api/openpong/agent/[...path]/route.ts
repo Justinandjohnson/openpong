@@ -30,6 +30,11 @@ const ALLOWED: RegExp[] = [
   /^companion\/pairing$/,
   /^companion\/gates$/,
   /^companion\/gates\/[\w-]+\/clear$/,
+  // Bring-your-own-key: read the view, save/remove the key, test it.
+  /^model-key$/,
+  /^model-key\/test$/,
+  // "Find me": the public player search behind the onboarding name field.
+  /^profile\/find$/,
 ];
 
 function allowed(path: string): boolean {
@@ -38,7 +43,7 @@ function allowed(path: string): boolean {
 
 async function forward(
   request: Request,
-  method: "GET" | "POST" | "DELETE",
+  method: "GET" | "POST" | "PUT" | "DELETE",
   segments: string[] | undefined,
 ) {
   const path = (segments ?? []).join("/");
@@ -47,7 +52,7 @@ async function forward(
   }
 
   let body: string | undefined;
-  if (method === "POST") {
+  if (method === "POST" || method === "PUT") {
     try {
       body = JSON.stringify((await request.json()) ?? {});
     } catch {
@@ -98,6 +103,11 @@ export async function GET(request: Request, context: { params: Promise<{ path?: 
 export async function POST(request: Request, context: { params: Promise<{ path?: string[] }> }) {
   const { path } = await context.params;
   return forward(request, "POST", path);
+}
+
+export async function PUT(request: Request, context: { params: Promise<{ path?: string[] }> }) {
+  const { path } = await context.params;
+  return forward(request, "PUT", path);
 }
 
 export async function DELETE(request: Request, context: { params: Promise<{ path?: string[] }> }) {

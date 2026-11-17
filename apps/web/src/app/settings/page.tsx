@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { AccountCard } from "@/components/account-card";
+import { AiKeyCard } from "@/components/ai-key-card";
 import { SmsCard } from "@/components/sms-card";
 import { Badge } from "@/components/ui/badge";
 import { buttonClassName } from "@/components/ui/button";
@@ -52,6 +53,7 @@ export default function SettingsPage() {
       <div className="lg:col-span-2">
         <AccountCard />
       </div>
+      <AiKeyCard />
       <SmsCard initialPhone={user.data?.phone_number ?? ""} />
       <Card>
         <CardHeader className="flex-row items-center justify-between">
@@ -176,7 +178,6 @@ export default function SettingsPage() {
           ))}
         </CardContent>
       </Card>
-
 
       <Card>
         <CardHeader>

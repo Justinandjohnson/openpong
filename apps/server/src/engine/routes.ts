@@ -56,6 +56,32 @@ export function agentRoutes(service: AgentService): Hono<{ Variables: { owner: s
   app.put("/profile", async (c) =>
     c.json(await service.saveProfile(c.get("owner"), await c.req.json())),
   );
+  /**
+   * "Find me": a best-effort public player search for the onboarding name field.
+   * Returns every distinct candidate and never throws; an unreachable source
+   * yields an empty list so the person can type their details themselves.
+   */
+  app.post("/profile/find", async (c) => {
+    const { name } = z
+      .object({ name: z.string().trim().min(1).max(200) })
+      .parse(await c.req.json());
+    return c.json(await service.findPlayers(name));
+  });
+  /**
+   * The owner's own AI key (bring-your-own-key). GET returns only
+   * `{configured, provider, model, hint}`; PUT stores it encrypted; DELETE
+   * forgets it so the host's key applies again; test runs a tiny real
+   * completion and always answers 200 with `{ok}` or `{ok:false,error}`.
+   */
+  app.get("/model-key", async (c) => c.json(await service.modelKey.view(c.get("owner"))));
+  app.put("/model-key", async (c) =>
+    c.json(await service.modelKey.save(c.get("owner"), await c.req.json())),
+  );
+  app.delete("/model-key", async (c) => c.json(await service.modelKey.remove(c.get("owner"))));
+  app.post("/model-key/test", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    return c.json(await service.modelKey.testKey(c.get("owner"), body));
+  });
   app.post("/tasks", async (c) => {
     const { requestId, ...input } = createTaskSchema
       .extend({ requestId: z.string().min(1).max(200).optional() })

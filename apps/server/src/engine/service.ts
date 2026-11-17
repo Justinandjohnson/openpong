@@ -52,9 +52,11 @@ import {
 } from "../onboarding/area.ts";
 import { RelayClient, RelayError } from "../relay/client.ts";
 import { SearchService } from "../search.ts";
+import { searchUsattPlayers } from "../usatt.ts";
 import type { WorkspaceService } from "../workspace.ts";
 import { analyzeSpending } from "./finance.ts";
 import { executeModelTask, taskAnswers } from "./model.ts";
+import { ModelKeyService } from "./model-key.ts";
 import {
   countPageDiff,
   describePageDiff,
@@ -69,11 +71,189 @@ const hash = (text: string) => createHash("sha256").update(text).digest("hex");
 type MonitorPage = { id: string; hash?: string; timelessHash?: string; lines: string[] };
 const date = () => new Date().toISOString();
 const terminal = new Set(["succeeded", "failed", "cancelled"]);
+
+/**
+ * One public player-search hit, normalised across the two upstream shapes
+ * (the OmniPong player search and the public USATT lookup). `usattId` and
+ * `rating` are best-effort: an upstream may omit either. Duplicate rows in the
+ * vendored table are known to exist, so callers return every distinct candidate
+ * and let the person choose — never silently pick one.
+ */
+export interface PlayerCandidate {
+  name: string;
+  usattId?: string;
+  rating?: number;
+  state?: string;
+  club?: string;
+  /** Where the row came from, so a live index can outrank a stale cache. */
+  source?: "usatt" | "local";
+}
+
+function candidateText(value: unknown): string | undefined {
+  if (typeof value === "string") return value.trim() || undefined;
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  return undefined;
+}
+
+function candidateNumber(value: unknown): number | undefined {
+  const text = candidateText(value);
+  if (!text) return undefined;
+  const number = Number(text.replace(/[^0-9.-]/g, ""));
+  return Number.isFinite(number) ? number : undefined;
+}
+
+function oneCandidate(value: unknown): PlayerCandidate | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  // The scraped players table carries a leading dash on some rows
+  // ("-Wang, Amy"); it is an artifact, not part of anyone's name.
+  const rawName = candidateText(row.name ?? row.full_name ?? row.player_name);
+  const name = rawName?.replace(/^[-–—\s]+/, "").trim();
+  if (!name) return null;
+  const usattId = candidateText(row.usattId ?? row.usatt_id ?? row.usatt_number ?? row.id);
+  const rating = candidateNumber(row.rating ?? row.current_rating);
+  const state = candidateText(row.state ?? row.home_state);
+  const club = candidateText(row.club ?? row.club_name);
+  // Which source produced the row decides who wins when two sources know the
+  // same person, so it has to survive this normalisation.
+  const source = row.source === "usatt" || row.source === "local" ? row.source : undefined;
+  return {
+    name,
+    ...(source ? { source } : {}),
+    ...(usattId ? { usattId } : {}),
+    ...(rating !== undefined ? { rating } : {}),
+    ...(state ? { state } : {}),
+    ...(club ? { club } : {}),
+  };
+}
+
+/** Unwrap the two upstream response shapes into a flat list of raw rows. */
+function candidateRows(value: unknown): unknown[] {
+  if (Array.isArray(value)) return value;
+  if (!value || typeof value !== "object") return [];
+  const row = value as Record<string, unknown>;
+  if (Array.isArray(row.players)) return row.players;
+  // A source may hand back its own result envelope (the USATT index does).
+  if (Array.isArray(row.candidates)) return row.candidates;
+  if (row.player && typeof row.player === "object") return [row.player];
+  if (row.success === false || row.status === "not_found") return [];
+  return [value];
+}
+
+/** Normalise and deduplicate candidates from any mix of upstream responses. */
+/**
+ * The local index stores names as "Last, First", so a person who types their
+ * own name the normal way ("Amy Wang") matches nothing. These are the query
+ * forms worth trying, most-likely first.
+ */
+export function nameVariants(query: string): string[] {
+  const trimmed = query.trim().replace(/\s+/g, " ");
+  if (!trimmed) return [];
+  const variants = new Set<string>([trimmed]);
+  const comma = trimmed.match(/^([^,]+),\s*(.+)$/);
+  if (comma) {
+    variants.add(`${comma[2].trim()} ${comma[1].trim()}`);
+  } else {
+    const parts = trimmed.split(" ");
+    if (parts.length >= 2) {
+      const last = parts[parts.length - 1];
+      variants.add(`${last}, ${parts.slice(0, -1).join(" ")}`);
+      if (parts.length >= 3) variants.add(`${parts.slice(1).join(" ")}, ${parts[0]}`);
+    }
+  }
+  return [...variants];
+}
+
+function tokensOf(value: string): string[] {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter(Boolean);
+}
+
+/**
+ * How well a candidate answers the query: 0 every word, in order; 1 every
+ * word, scrambled; 2 some word; 3 none. Only tokens of three or more
+ * characters may match as prefixes, so "Bo" cannot match "Bobby".
+ */
+export function nameRank(candidate: PlayerCandidate, query: string): number {
+  const want = tokensOf(query);
+  if (!want.length) return 3;
+  const have = tokensOf(candidate.name);
+  const has = (token: string) =>
+    have.some((word) => word === token || (token.length >= 3 && word.startsWith(token)));
+  if (want.every(has)) {
+    let cursor = 0;
+    for (const token of want) {
+      const at = have.findIndex(
+        (word, index) =>
+          index >= cursor && (word === token || (token.length >= 3 && word.startsWith(token))),
+      );
+      if (at === -1) return 1;
+      cursor = at + 1;
+    }
+    return 0;
+  }
+  return want.some(has) ? 2 : 3;
+}
+
+/** Best answers first, then the strongest rating, then the name. */
+export function rankCandidates(candidates: PlayerCandidate[], query: string): PlayerCandidate[] {
+  const ranked = candidates
+    .map((candidate) => ({ candidate, rank: nameRank(candidate, query) }))
+    .sort(
+      (a, b) =>
+        a.rank - b.rank ||
+        (b.candidate.rating ?? -1) - (a.candidate.rating ?? -1) ||
+        a.candidate.name.localeCompare(b.candidate.name),
+    );
+  // A partial match is still a match, but a query that matched nobody at all
+  // must not be padded out with unrelated rows.
+  const hits = ranked.filter((entry) => entry.rank < 3);
+  return (hits.length ? hits : ranked).map((entry) => entry.candidate);
+}
+
+/** "Wang, Amy" and "Amy Wang" are the same two words; sort them to compare. */
+function nameKey(name: string): string {
+  return tokensOf(name).sort().join(" ");
+}
+
+export function playerCandidates(...values: unknown[]): PlayerCandidate[] {
+  const seen = new Set<string>();
+  const byName = new Map<string, number>();
+  const candidates: PlayerCandidate[] = [];
+  for (const value of values)
+    for (const raw of candidateRows(value)) {
+      const candidate = oneCandidate(raw);
+      if (!candidate) continue;
+      const key = (
+        candidate.usattId ?? `${candidate.name.toLowerCase()}|${candidate.state ?? ""}`
+      ).toLowerCase();
+      if (seen.has(key)) continue;
+      // The same person can appear in the live USATT index and in the local
+      // scraped cache. Same words means same person, so the live row replaces
+      // the cached one instead of being listed twice.
+      const nameSlot = nameKey(candidate.name);
+      const existing = byName.get(nameSlot);
+      if (existing !== undefined) {
+        if (candidate.source === "usatt") candidates[existing] = candidate;
+        continue;
+      }
+      seen.add(key);
+      byName.set(nameSlot, candidates.length);
+      candidates.push(candidate);
+      if (candidates.length >= 25) return candidates;
+    }
+  return candidates;
+}
 export class AgentService {
   readonly worker: TaskWorker;
   readonly search: SearchService;
   /** The Pong calendar hub: Google secondary calendar or tokenised iCal feed. */
   readonly calendar: CalendarService;
+  /** Bring-your-own-key for the coach: per-owner, encrypted at rest. */
+  readonly modelKey: ModelKeyService;
   private maintenance?: ReturnType<typeof setInterval>;
   private refreshing = false;
   constructor(
@@ -99,6 +279,7 @@ export class AgentService {
     }),
   ) {
     this.search = new SearchService(db);
+    this.modelKey = new ModelKeyService(db, config);
     this.calendar = new CalendarService(db, config, {
       omnipong: this.omnipong,
       profile: (owner) => this.getProfile(owner),
@@ -200,6 +381,67 @@ export class AgentService {
     };
     const profile: OwnerProfile = { ...clean, id: "profile", updatedAt: date() };
     return this.db.put(owner, "agent-settings", profile);
+  }
+  /**
+   * Merge the fields the owner just confirmed into their saved profile, without
+   * clobbering anything they did not mention. Only keys actually present in the
+   * patch are applied; the merged result is validated by the same schema, so a
+   * patch that leaves no name (or an invalid value) is rejected and nothing is
+   * written. This backs the `save_my_profile` chat tool.
+   */
+  async mergeProfile(owner: string, raw: unknown): Promise<OwnerProfile> {
+    const existing = await this.db.get<OwnerProfile>(owner, "agent-settings", "profile");
+    const patch: Record<string, unknown> = {};
+    if (raw && typeof raw === "object")
+      for (const [key, value] of Object.entries(raw as Record<string, unknown>))
+        if (value !== undefined) patch[key] = value;
+    const merged = { ...(existing ?? {}), ...patch };
+    return this.saveProfile(owner, merged);
+  }
+  /**
+   * `POST /api/agent/profile/find`: best-effort public player search used by the
+   * "Find me" button. Tries the OmniPong player search and the public USATT
+   * lookup, deduplicates, and never throws — a bad upstream returns an empty
+   * candidate list so the person can type their details themselves.
+   */
+  async findPlayers(name: string): Promise<{ candidates: PlayerCandidate[]; errors: string[] }> {
+    const query = name.trim();
+    if (!query) return { candidates: [], errors: [] };
+    // The local index is "Last, First", so try the name both ways round; the
+    // online sources take the query as typed.
+    const localSearches = nameVariants(query).map((variant) =>
+      this.omnipong.searchLocalPlayers(variant),
+    );
+    const settled = await Promise.allSettled([
+      // The national USATT index answers for any name and is authoritative, so
+      // it leads; a tie between sources therefore resolves to it.
+      searchUsattPlayers(query),
+      ...localSearches,
+      this.omnipong.searchPlayer(query),
+      this.omnipong.lookupUsatt(query),
+    ]);
+    const values: unknown[] = [];
+    const errors: string[] = [];
+    let answered = 0;
+    for (const result of settled) {
+      if (result.status === "fulfilled") {
+        values.push(result.value);
+        answered += 1;
+      } else
+        errors.push(
+          result.reason instanceof Error ? result.reason.message : "A player source is unavailable",
+        );
+    }
+    const candidates = rankCandidates(playerCandidates(...values), query);
+    if (candidates.length) return { candidates, errors: [] };
+    // Nothing found: say which of the two it is, in plain words. A gated or
+    // scraper-only source failing must not be read out as "you don't exist".
+    return {
+      candidates: [],
+      errors: answered
+        ? [`No player found matching "${query}".`]
+        : ["The player lookup service is unavailable right now."],
+    };
   }
   /** `GET /api/agent/profile`: the record plus first-run detection. */
   async profileView(owner: string): Promise<{ profile: OwnerProfile | null; onboarded: boolean }> {

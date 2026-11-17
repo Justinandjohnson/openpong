@@ -14,6 +14,8 @@ import {
 } from "lucide-react";
 import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
+import { AiKeyCard } from "@/components/ai-key-card";
+import { FindPlayer, type PlayerCandidate } from "@/components/find-player";
 import { InstallButton } from "@/components/pwa";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -102,6 +104,10 @@ export default function SetupPage() {
   const [phoneNote, setPhoneNote] = useState<string | null>(null);
   const [phoneBusy, setPhoneBusy] = useState(false);
   const [calBusy, setCalBusy] = useState(false);
+  const [nameDraft, setNameDraft] = useState("");
+  const [nameNote, setNameNote] = useState<string | null>(null);
+  const [nameBusy, setNameBusy] = useState(false);
+  const [picked, setPicked] = useState<PlayerCandidate | null>(null);
 
   useEffect(() => subscribeInstall(setInstall), []);
 
@@ -141,6 +147,46 @@ export default function SetupPage() {
   useEffect(() => {
     if (user.data?.phone_number) setPhoneDraft(user.data.phone_number);
   }, [user.data]);
+  useEffect(() => {
+    if (current?.displayName) setNameDraft(current.displayName);
+  }, [current?.displayName]);
+
+  function applyCandidate(candidate: PlayerCandidate) {
+    setPicked(candidate);
+    setNameDraft(candidate.name);
+    setNameNote(null);
+  }
+
+  async function saveName() {
+    setNameBusy(true);
+    setNameNote(null);
+    const payload: Record<string, unknown> = {
+      ...(current ?? {}),
+      displayName: nameDraft.trim(),
+    };
+    if (picked?.usattId) payload.usattId = picked.usattId;
+    if (picked?.state) {
+      const states = new Set([...(current?.states ?? []), picked.state]);
+      payload.states = [...states];
+    }
+    if (picked?.club) {
+      const clubs = new Set([...(current?.clubs ?? []), picked.club]);
+      payload.clubs = [...clubs];
+    }
+    const response = await fetch("/api/profile", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    }).catch(() => null);
+    const body = (await response?.json().catch(() => null)) as { error?: string } | null;
+    setNameBusy(false);
+    if (!response?.ok) {
+      setNameNote(body?.error ?? "Could not save your name.");
+      return;
+    }
+    setNameNote("Saved. The coach knows who you are now.");
+    void loadProfile();
+  }
 
   const hasName = Boolean(current?.displayName?.trim());
   const hasArea = Boolean(current?.cities?.length || current?.states?.length);
@@ -260,7 +306,8 @@ export default function SetupPage() {
             <CardTitle className="text-base">Get set up</CardTitle>
             <p className="mt-1 text-[11px] leading-snug text-muted-foreground">
               Five steps and OpenPong manages your table tennis life: it knows who you are and where
-              you play, pulls your league results, and puts everything on one calendar.
+              you play, pulls your league results, and puts everything on one calendar. Optionally
+              paste your own AI key so the coach runs on your account.
             </p>
             <div className="mt-3 flex items-center gap-3">
               <div className="h-2 min-w-0 flex-1 overflow-hidden rounded-full bg-secondary">
@@ -308,6 +355,31 @@ export default function SetupPage() {
         description="Tournament searches, the daily scout and the coach all filter to your area, so nothing else's results get mixed in."
         done={hasName && hasArea}
       >
+        <div className="mb-3 rounded-xl border border-border bg-background/40 p-3">
+          <p className="text-[10px] font-bold uppercase tracking-[0.16em] text-muted-foreground">
+            Give your name, and we'll find you
+          </p>
+          <p className="mt-1 mb-2 text-[11px] leading-snug text-muted-foreground">
+            Type your name, pick the person who is you, and we fill in your USATT number and state.
+            Could not find you? Just type your name and save it yourself.
+          </p>
+          <div className="flex flex-wrap items-center gap-2">
+            <input
+              value={nameDraft}
+              onChange={(event) => setNameDraft(event.target.value)}
+              placeholder="Your name"
+              aria-label="Your name"
+              className="min-h-10 min-w-0 flex-1 rounded-xl border border-border bg-card px-3 text-sm text-foreground outline-none focus:border-primary"
+            />
+            <Button size="sm" onClick={saveName} disabled={nameBusy || !nameDraft.trim()}>
+              {nameBusy ? <Loader2 className="size-3.5 animate-spin" /> : null} Save name
+            </Button>
+          </div>
+          <div className="mt-2">
+            <FindPlayer initialName={nameDraft} onPick={applyCandidate} compact />
+          </div>
+          {nameNote && <p className="mt-2 text-[11px] text-muted-foreground">{nameNote}</p>}
+        </div>
         <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
           <span className="flex items-center gap-1.5">
             <UserRound className="size-3.5" />
@@ -414,6 +486,16 @@ export default function SetupPage() {
 
       <Step
         index={6}
+        title="Your AI key"
+        description="Optional. Paste a key from OpenRouter, OpenAI, Anthropic or Google Gemini and the coach runs on your key instead of the server's. It takes about a minute and nothing else needs installing."
+        done={false}
+        optional
+      >
+        <AiKeyCard bare />
+      </Step>
+
+      <Step
+        index={7}
         title="Browser"
         description="Built in. The coach reads and acts on public pages in the app's own browser, and you can take over that same window whenever a page needs your login, 2FA or a captcha. Nothing to install."
         done

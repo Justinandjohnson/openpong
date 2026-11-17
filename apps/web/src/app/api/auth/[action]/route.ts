@@ -47,14 +47,37 @@ export async function POST(request: Request, { params }: { params: Promise<{ act
   return NextResponse.json({ ok: true, account: data.account ?? null });
 }
 
+/**
+ * Ask the server whether it hosts accounts and whether Google sign-in is ready.
+ * `start` is the one public route that answers both in a single call: 403 when
+ * accounts are off, 503 when Google is unconfigured, and a consent URL when both
+ * are ready. The state it signs is stateless, so probing it changes nothing.
+ */
+async function signInAvailability(
+  redirectBase: string,
+): Promise<{ accounts: boolean; google: boolean }> {
+  const result = await fetchJson(`${OPENPONG_SERVER_URL}/api/auth/google/start`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ redirectBase }),
+    timeoutMs: 8000,
+  }).catch(() => null);
+  if (!result || result.status === 403) return { accounts: false, google: false };
+  return { accounts: true, google: result.ok };
+}
+
 /** Who the sealed cookie belongs to, without trusting anything the browser sent. */
-export async function GET(_request: Request, { params }: { params: Promise<{ action: string }> }) {
+export async function GET(request: Request, { params }: { params: Promise<{ action: string }> }) {
   const { action } = await params;
   if (action !== "me") return NextResponse.json({ error: "Unknown action" }, { status: 404 });
 
+  const availability = await signInAvailability(new URL(request.url).origin);
   const token = await readAccountToken();
   if (!token) {
-    return NextResponse.json({ account: null, accounts: false }, { status: 200 });
+    return NextResponse.json(
+      { account: null, accounts: availability.accounts, google: availability.google },
+      { status: 200 },
+    );
   }
   const result = await fetchJson(`${OPENPONG_SERVER_URL}/api/auth/me`, {
     headers: { authorization: `Bearer ${token}`, accept: "application/json" },
@@ -63,10 +86,18 @@ export async function GET(_request: Request, { params }: { params: Promise<{ act
   if (!result.ok) {
     // A dead or rotated account must not leave a permanent ghost cookie.
     if (result.status === 401) await clearAccountToken();
-    return NextResponse.json({ account: null, accounts: result.status !== 404 }, { status: 200 });
+    return NextResponse.json(
+      {
+        account: null,
+        accounts: result.status !== 404,
+        google: availability.google,
+      },
+      { status: 200 },
+    );
   }
   return NextResponse.json({
     account: (result.data as { account?: unknown })?.account ?? null,
     accounts: true,
+    google: availability.google,
   });
 }
