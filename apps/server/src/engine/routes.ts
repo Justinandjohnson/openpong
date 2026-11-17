@@ -8,6 +8,7 @@ import type {
 } from "../../../../packages/domain/src/agent.ts";
 import { createTaskSchema } from "../../../../packages/domain/src/agent.ts";
 import { AppError } from "../errors.ts";
+import { CALENDAR_READ_NOT_CONNECTED } from "../workspace.ts";
 import type { AgentService } from "./service.ts";
 
 const text = z.string().trim().min(1).max(4000);
@@ -300,6 +301,24 @@ export function agentRoutes(service: AgentService): Hono<{ Variables: { owner: s
    * the Google connection and the current feed link.
    */
   app.get("/calendar", async (c) => c.json(await service.calendar.status(c.get("owner"))));
+  /**
+   * The owner's calendars as context for the calendar screen. Read-only and
+   * owner-scoped; when Google is not connected it answers with the honest
+   * not-connected error instead of an empty calendar (the iCal feed is
+   * write-only and cannot be read back).
+   */
+  app.get("/calendar/agenda", async (c) => {
+    const query = z
+      .object({
+        from: z.iso.datetime({ offset: true }).optional(),
+        to: z.iso.datetime({ offset: true }).optional(),
+        calendar: z.string().min(1).max(1024).optional(),
+      })
+      .parse(c.req.query());
+    const agenda = await service.workspace.agenda(c.get("owner"), query);
+    if (!agenda.connected) throw new AppError(CALENDAR_READ_NOT_CONNECTED, 409);
+    return c.json(agenda);
+  });
   app.post("/calendar/connect", async (c) =>
     c.json(await service.calendar.connectUrl(c.get("owner"))),
   );
@@ -307,6 +326,32 @@ export function agentRoutes(service: AgentService): Hono<{ Variables: { owner: s
   app.delete("/calendar", async (c) => c.json(await service.calendar.disconnect(c.get("owner"))));
   app.post("/calendar/feed/rotate", async (c) =>
     c.json(await service.calendar.rotateFeed(c.get("owner"))),
+  );
+  /**
+   * The owner's calendars over MCP. Two interchangeable backends: Google's
+   * official Calendar MCP server (first party, reuses the Google connection) or
+   * Zapier MCP (no Google Cloud project — the owner pastes a connection token).
+   * `GET` never returns the token, only its last four characters.
+   */
+  app.get("/calendar/mcp", async (c) => c.json(await service.calendarMcp.view(c.get("owner"))));
+  app.put("/calendar/mcp", async (c) =>
+    c.json(await service.calendarMcp.save(c.get("owner"), await c.req.json().catch(() => ({})))),
+  );
+  app.delete("/calendar/mcp", async (c) =>
+    c.json(await service.calendarMcp.remove(c.get("owner"))),
+  );
+  app.get("/calendar/mcp/agenda", async (c) => {
+    const query = z
+      .object({
+        from: z.iso.datetime({ offset: true }).optional(),
+        to: z.iso.datetime({ offset: true }).optional(),
+        calendar: z.string().min(1).max(1024).optional(),
+      })
+      .parse(c.req.query());
+    return c.json(await service.calendarMcp.agenda(c.get("owner"), query));
+  });
+  app.post("/calendar/mcp/tools", async (c) =>
+    c.json({ tools: await service.calendarMcp.listTools(c.get("owner")) }),
   );
   return app;
 }

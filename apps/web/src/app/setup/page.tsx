@@ -431,7 +431,7 @@ export default function SetupPage() {
       <Step
         index={4}
         title="Your calendar"
-        description="One button creates a calendar called Pong and keeps your tournaments, sign-ups and results in it. Google connects directly; Apple and Outlook subscribe to a private link."
+        description="Google connects once so the coach can read the calendars you choose as context and keep a Pong calendar of your tournaments, sign-ups and results; Apple and Outlook subscribe to a private, write-only link."
         done={calendarDone}
       >
         {calendarDone ? (

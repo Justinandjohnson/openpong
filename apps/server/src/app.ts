@@ -86,7 +86,7 @@ export async function createApp(
   });
   const browser = new BrowserService(db, config, auth, files);
   const computer = new ComputerService(db, config, options.docker);
-  agent = new AgentService(db, config, workspace, files, actions, browser, computer);
+  agent = new AgentService(db, config, workspace, files, actions, browser, computer, undefined, undefined, google);
   // Rich Threads are opt-in. Without a key the runtime runs native AG-UI:
   // chat streams and tools run, but conversations do not sync across devices.
   const intelligenceApiKey = config.intelligenceApiKey?.trim();

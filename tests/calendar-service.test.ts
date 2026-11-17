@@ -322,20 +322,21 @@ test("syncAll maps upcoming tournaments and confirmed sign-ups with stable keys"
   assert.equal(result.created, 2);
 });
 
-test("connecting a calendar asks only for the calendar, never for mail or the owner's own events", async (t) => {
+test("connecting a calendar asks to read the chosen calendars and write only the Pong calendar", async (t) => {
   const db = await createStore();
   t.after(() => db.close());
   const config = configWithGoogle();
   const auth = new GoogleAuth(db, config);
   const { url } = await auth.connectCalendar(owner);
   const scopes = new URL(url).searchParams.get("scope")?.split(" ") ?? [];
+  // The Pong calendar it created (write) and the calendars the person chose (read).
   assert.ok(scopes.includes("https://www.googleapis.com/auth/calendar.app.created"));
   assert.ok(scopes.includes("https://www.googleapis.com/auth/calendar.calendarlist.readonly"));
+  assert.ok(scopes.includes("https://www.googleapis.com/auth/calendar.events.readonly"));
   // A person pressing "Connect Google" for a calendar is not handing over their
-  // inbox, and not handing over the events already on their own calendars.
+  // inbox, and not handing over write access to their own events.
   assert.equal(scopes.includes("https://www.googleapis.com/auth/gmail.readonly"), false);
   assert.equal(scopes.includes("https://www.googleapis.com/auth/gmail.send"), false);
-  assert.equal(scopes.includes("https://www.googleapis.com/auth/calendar.events.readonly"), false);
   assert.equal(scopes.includes("https://www.googleapis.com/auth/calendar.events"), false);
 });
 

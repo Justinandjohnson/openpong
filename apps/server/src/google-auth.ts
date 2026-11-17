@@ -173,20 +173,27 @@ export class GoogleAuth {
     return { url: url.toString() };
   }
   /**
-   * The one-button calendar connect: the Pong calendar needs `calendar.app.created`
-   * so it can create and manage only the calendar this app made, plus
-   * `calendar.calendarlist.readonly` so it can find that calendar again.
+   * The one-button calendar connect asks for exactly three things and nothing
+   * else:
    *
-   * Deliberately NOT the mail or the broad event scopes: a person pressing
-   * "Connect Google" for a calendar must never be asked to hand over their
-   * inbox, and must never hand over the ability to read the events already on
-   * their own calendars.
+   * - `calendar.app.created` — create and manage only the Pong calendar this
+   *   app made.
+   * - `calendar.calendarlist.readonly` — find that calendar again.
+   * - `calendar.events.readonly` — see the events on the calendars the person
+   *   chose, so the coach can answer schedule questions and spot clashes.
+   *
+   * Deliberately NOT mail (gmail.readonly / gmail.send) and NOT the broad
+   * `calendar.events` write scope: pressing "Connect Google" for a calendar
+   * must never hand over the inbox, and the only calendar the app can write to
+   * is the Pong calendar it created. Reading is consented to on the screen; it
+   * is never smuggled in.
    */
   async connectCalendar(owner: string) {
     return this.connect(owner, false, {
       scopes: [
         CALENDAR_APP_CREATED_SCOPE,
         "https://www.googleapis.com/auth/calendar.calendarlist.readonly",
+        "https://www.googleapis.com/auth/calendar.events.readonly",
       ],
     });
   }

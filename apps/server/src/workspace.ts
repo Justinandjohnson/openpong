@@ -20,6 +20,39 @@ import { AppError } from "./errors.ts";
 import type { Files } from "./files.ts";
 import type { GoogleAuth } from "./google-auth.ts";
 
+/** The honest answer when a calendar read is asked for without a Google connection. */
+export const CALENDAR_READ_NOT_CONNECTED =
+  "Reading your calendars needs Google connected. The private iCal feed is write-only and cannot be read back, so connect Google to let the coach use your calendars as context.";
+
+export interface CalendarAgendaEvent {
+  title: string;
+  start: string;
+  end: string;
+  allDay: boolean;
+  location?: string;
+  /** The display name of the calendar the event came from. */
+  calendar: string;
+}
+export interface CalendarAgenda {
+  events: CalendarAgendaEvent[];
+  /** The names of the owner's calendars, so the coach can say what it can see. */
+  calendars: string[];
+  truncated: boolean;
+  connected: boolean;
+}
+
+/** Bound the agenda payload: at most this many calendars and events. */
+const AGENDA_MAX_CALENDARS = 10;
+const AGENDA_MAX_EVENTS = 50;
+const AGENDA_DEFAULT_WINDOW_MS = 14 * 24 * 60 * 60 * 1000;
+/** A read never spans more than this, however wide the request. */
+const AGENDA_MAX_WINDOW_MS = 90 * 24 * 60 * 60 * 1000;
+
+function clipAgendaText(text: string, limit: number): string {
+  const clipped = text.slice(0, limit);
+  return text.length > limit && /[\uD800-\uDBFF]$/.test(clipped) ? clipped.slice(0, -1) : clipped;
+}
+
 export class WorkspaceService {
   private seeding = new Map<string, Promise<void>>();
   constructor(
@@ -106,6 +139,70 @@ export class WorkspaceService {
       })
       .sort((a, b) => a.start.localeCompare(b.start));
     return { events, truncated: false };
+  }
+  /**
+   * The owner's calendars as context for the coach and the calendar screen: the
+   * events on the calendars they connected, mapped to a small, mail-free shape.
+   * A missing connection is honest (`connected:false`), never an empty calendar.
+   * The window defaults to the next 14 days and is clamped to 90; the payload is
+   * capped at 10 calendars and 50 events. It reads only through the same
+   * `calendars`/`eventsPage` path the rest of the workspace uses.
+   */
+  async agenda(
+    owner: string,
+    options: { from?: string; to?: string; calendar?: string } = {},
+  ): Promise<CalendarAgenda> {
+    const nowMs = Date.now();
+    const fromMs = options.from ? Date.parse(options.from) : Number.NaN;
+    const startMs = Number.isFinite(fromMs) ? fromMs : nowMs;
+    const toMs = options.to ? Date.parse(options.to) : Number.NaN;
+    const wantedEndMs = Number.isFinite(toMs) ? toMs : startMs + AGENDA_DEFAULT_WINDOW_MS;
+    let endMs = wantedEndMs > startMs ? wantedEndMs : startMs + AGENDA_DEFAULT_WINDOW_MS;
+    if (endMs - startMs > AGENDA_MAX_WINDOW_MS) endMs = startMs + AGENDA_MAX_WINDOW_MS;
+    const timeMin = new Date(startMs).toISOString();
+    const timeMax = new Date(endMs).toISOString();
+
+    const calendars = await this.calendars(owner);
+    if (!calendars.length) return { events: [], calendars: [], truncated: false, connected: false };
+    const names = calendars.map((calendar) => calendar.name);
+    const wanted = options.calendar?.trim();
+    const selected = (
+      wanted
+        ? calendars.filter(
+            (calendar) =>
+              calendar.id === wanted || calendar.name.toLowerCase() === wanted.toLowerCase(),
+          )
+        : calendars
+    ).slice(0, AGENDA_MAX_CALENDARS);
+
+    const events: CalendarAgendaEvent[] = [];
+    let truncated = false;
+    for (const calendar of selected) {
+      const page = await this.eventsPage(owner, { calendarId: calendar.id, timeMin, timeMax });
+      // The connection disappeared mid-read: report it honestly rather than an
+      // empty calendar.
+      if (!page) return { events: [], calendars: names, truncated: false, connected: false };
+      truncated = truncated || page.truncated;
+      for (const event of page.events) {
+        const title = clipAgendaText(event.title, 500);
+        const location = clipAgendaText(event.location, 500);
+        truncated = truncated || title !== event.title || location !== event.location;
+        events.push({
+          title,
+          start: event.start,
+          end: event.end,
+          allDay: event.allDay,
+          ...(location ? { location } : {}),
+          calendar: calendar.name,
+        });
+      }
+    }
+    events.sort((a, b) => a.start.localeCompare(b.start) || a.title.localeCompare(b.title));
+    if (events.length > AGENDA_MAX_EVENTS) {
+      truncated = true;
+      events.length = AGENDA_MAX_EVENTS;
+    }
+    return { events, calendars: names, truncated, connected: true };
   }
   private async cacheMail(owner: string, mail: Mail[], connectionId: string) {
     const imports = await this.db.list<{ id: string; artifactId: string; connectionId?: string }>(

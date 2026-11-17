@@ -6,12 +6,15 @@ import {
   Check,
   Copy,
   ExternalLink,
+  Eye,
   Loader2,
   RefreshCw,
   RotateCcw,
+  ShieldCheck,
   Unplug,
 } from "lucide-react";
 import { useCallback, useEffect, useState } from "react";
+import { CalendarMcpCard } from "@/components/calendar-mcp-card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -24,6 +27,22 @@ interface Status {
   feedUrl?: string;
   lastSyncAt?: string;
   error?: string;
+}
+
+interface AgendaEvent {
+  title: string;
+  start: string;
+  end: string;
+  allDay: boolean;
+  location?: string;
+  calendar: string;
+}
+
+interface Agenda {
+  events: AgendaEvent[];
+  calendars: string[];
+  truncated: boolean;
+  connected: boolean;
 }
 
 interface SyncResult {
@@ -54,6 +73,27 @@ const WHAT_GOES_IN = [
   "Your match results, so a week is visible at a glance",
 ];
 
+const CONTEXT_GRANTED = [
+  "See the events on the calendars you choose, so the coach can answer schedule questions and spot clashes",
+  "Create and manage the Pong calendar it made",
+  "Never your mail, and never changes to the calendars you already own",
+];
+
+function formatDay(value: string): string {
+  const date = new Date(value);
+  return Number.isFinite(date.getTime())
+    ? date.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" })
+    : value.slice(0, 10);
+}
+
+function formatTime(event: AgendaEvent): string {
+  if (event.allDay) return "All day";
+  const date = new Date(event.start);
+  return Number.isFinite(date.getTime())
+    ? date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" })
+    : event.start.slice(11, 16);
+}
+
 export default function CalendarPage() {
   const [status, setStatus] = useState<Status | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -61,6 +101,8 @@ export default function CalendarPage() {
   const [copied, setCopied] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [feed, setFeed] = useState<string | null>(null);
+  const [agenda, setAgenda] = useState<Agenda | null>(null);
+  const [agendaError, setAgendaError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -72,9 +114,31 @@ export default function CalendarPage() {
     }
   }, []);
 
+  const loadAgenda = useCallback(async () => {
+    setAgendaError(null);
+    try {
+      const response = await fetch(`${ENDPOINT}/agenda`, {
+        headers: { accept: "application/json" },
+        cache: "no-store",
+      });
+      const body = (await response.json().catch(() => ({}))) as Agenda & { error?: string };
+      // The server answers 409 when reading has no Google connection; that is a
+      // state, not a failure, and the card explains it.
+      if (response.status === 409) {
+        setAgenda({ events: [], calendars: [], truncated: false, connected: false });
+        return;
+      }
+      if (!response.ok) throw new Error(body.error || "Could not read your calendars.");
+      setAgenda(body);
+    } catch (cause) {
+      setAgendaError(cause instanceof Error ? cause.message : "Could not read your calendars.");
+    }
+  }, []);
+
   useEffect(() => {
     void load();
-  }, [load]);
+    void loadAgenda();
+  }, [load, loadAgenda]);
 
   async function connect() {
     setBusy("connect");
@@ -131,6 +195,7 @@ export default function CalendarPage() {
       setSync(null);
       setFeed(null);
       await load();
+      await loadAgenda();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "Could not disconnect.");
     } finally {
@@ -151,6 +216,15 @@ export default function CalendarPage() {
 
   const provider = status?.provider;
   const webcal = feed ? feed.replace(/^https?:\/\//, "webcal://") : null;
+  const nowMs = Date.now();
+  const upcoming = (agenda?.events ?? [])
+    .filter((event) => {
+      const start = Date.parse(event.start);
+      return (
+        Number.isFinite(start) && start >= nowMs - 12 * 3600000 && start <= nowMs + 7 * 86400000
+      );
+    })
+    .slice(0, 8);
 
   return (
     <div className="flex flex-col gap-3 pb-2">
@@ -347,6 +421,106 @@ export default function CalendarPage() {
           </CardContent>
         </Card>
       </div>
+
+      <Card className="flex flex-col">
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Eye className="size-4 text-primary" /> Your calendars as context
+          </CardTitle>
+          <p className="text-[11px] text-muted-foreground">
+            Connecting lets OpenPong (a) see the events on the calendars you choose, so the coach
+            can answer schedule questions and spot clashes, and (b) create and manage the Pong
+            calendar. It never reads your mail, and it never changes events on the calendars you
+            already own.
+          </p>
+        </CardHeader>
+        <CardContent className="flex flex-col gap-3">
+          <div className="rounded-xl border border-border bg-background/40 p-3">
+            <p className="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+              <ShieldCheck className="size-3.5" /> What you grant
+            </p>
+            <ul className="mt-1.5 grid gap-1 text-[11px] sm:grid-cols-2">
+              {CONTEXT_GRANTED.map((item) => (
+                <li key={item} className="flex items-start gap-1.5">
+                  <Check className="mt-0.5 size-3 shrink-0 text-primary" />
+                  {item}
+                </li>
+              ))}
+            </ul>
+          </div>
+
+          {agendaError ? (
+            <p className="rounded-xl border border-destructive/40 bg-destructive/10 px-3 py-2 text-[11px] text-destructive-foreground">
+              {agendaError}
+            </p>
+          ) : agenda === null ? (
+            <Skeleton className="h-20 w-full" />
+          ) : agenda.connected ? (
+            <div className="flex flex-col gap-2">
+              <div className="flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
+                <Badge variant="accent">Read access</Badge>
+                <span>
+                  {agenda.calendars.length === 1
+                    ? "Seeing 1 calendar"
+                    : `Seeing ${agenda.calendars.length} calendars`}
+                  {agenda.calendars.length ? `: ${agenda.calendars.slice(0, 3).join(", ")}` : ""}
+                </span>
+              </div>
+              <div className="rounded-xl border border-border bg-background/50 p-3">
+                <p className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                  Next 7 days
+                </p>
+                {upcoming.length ? (
+                  <ul className="mt-1.5 flex flex-col gap-1">
+                    {upcoming.map((event) => (
+                      <li
+                        key={`${event.calendar}:${event.start}:${event.title}`}
+                        className="flex items-baseline justify-between gap-3 text-[11px]"
+                      >
+                        <span className="min-w-0 truncate font-semibold text-foreground">
+                          {event.title}
+                        </span>
+                        <span className="shrink-0 text-muted-foreground">
+                          {formatDay(event.start)} · {formatTime(event)}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                ) : (
+                  <p className="mt-1 text-[11px] text-muted-foreground">
+                    Nothing on your calendars in the next 7 days.
+                  </p>
+                )}
+                {agenda.truncated && (
+                  <p className="mt-1.5 text-[10px] text-muted-foreground/80">
+                    Showing the first few; there may be more.
+                  </p>
+                )}
+              </div>
+            </div>
+          ) : (
+            <div className="flex flex-col gap-2 rounded-xl border border-border bg-background/40 p-3">
+              <p className="text-[11px] leading-relaxed text-muted-foreground">
+                Reading your calendars needs Google connected. The private iCal feed is write-only
+                and cannot be read back, so the coach cannot use your calendars as context without
+                it.
+              </p>
+              <div className="flex flex-wrap gap-2">
+                <Button variant="accent" size="sm" onClick={connect} disabled={busy !== null}>
+                  {busy === "connect" ? (
+                    <Loader2 className="size-3.5 animate-spin" />
+                  ) : (
+                    <CalendarDays className="size-3.5" />
+                  )}
+                  Connect Google
+                </Button>
+              </div>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      <CalendarMcpCard />
     </div>
   );
 }

@@ -36,6 +36,7 @@ import type {
 } from "../../../../packages/domain/src/index.ts";
 import type { ActionService } from "../actions.ts";
 import type { BrowserService } from "../browser.ts";
+import { CalendarMcpService, type CalendarTokenSource } from "../calendar/mcp-service.ts";
 import { CalendarService } from "../calendar/service.ts";
 import { ComputerService } from "../computer.ts";
 import type { Config } from "../config.ts";
@@ -252,6 +253,12 @@ export class AgentService {
   readonly search: SearchService;
   /** The Pong calendar hub: Google secondary calendar or tokenised iCal feed. */
   readonly calendar: CalendarService;
+  /**
+   * The owner's real calendars over MCP. Two interchangeable backends: Google's
+   * official Calendar MCP server (first party) or Zapier MCP (no Google Cloud
+   * project). Optional — with nothing connected the tools say so.
+   */
+  readonly calendarMcp: CalendarMcpService;
   /** Bring-your-own-key for the coach: per-owner, encrypted at rest. */
   readonly modelKey: ModelKeyService;
   private maintenance?: ReturnType<typeof setInterval>;
@@ -277,9 +284,12 @@ export class AgentService {
       url: config.relayUrl,
       token: config.relayToken,
     }),
+    // Used only to mint a Google bearer for the official Calendar MCP server.
+    readonly google: CalendarTokenSource | undefined = undefined,
   ) {
     this.search = new SearchService(db);
     this.modelKey = new ModelKeyService(db, config);
+    this.calendarMcp = new CalendarMcpService(db, google);
     this.calendar = new CalendarService(db, config, {
       omnipong: this.omnipong,
       profile: (owner) => this.getProfile(owner),

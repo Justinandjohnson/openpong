@@ -22,6 +22,10 @@ const ALLOWED: RegExp[] = [
   /^monitors\/[\w-]+\/control$/,
   /^notifications\/[\w-]+\/read$/,
   /^calendar$/,
+  /^calendar\/agenda$/,
+  /^calendar\/mcp$/,
+  /^calendar\/mcp\/agenda$/,
+  /^calendar\/mcp\/tools$/,
   /^calendar\/(connect|sync|feed\/rotate)$/,
   /^phone$/,
   /^phone\/test$/,
@@ -63,9 +67,12 @@ async function forward(
   try {
     const token = await requiredOpenPongToken();
     // Approvals live on /api/actions/:id/decide; everything else on /api/agent/*.
-    const upstream = path.startsWith("actions/")
+    const base = path.startsWith("actions/")
       ? `${OPENPONG_SERVER_URL}/api/${path}`
       : `${OPENPONG_SERVER_URL}/api/agent/${path}`;
+    // Carry the query string through so read routes (for example the calendar
+    // agenda's from/to/calendar) keep working behind this proxy.
+    const upstream = `${base}${new URL(request.url).search}`;
     const result = await fetchJson(upstream, {
       method,
       headers: {
