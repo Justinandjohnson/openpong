@@ -322,7 +322,7 @@ test("syncAll maps upcoming tournaments and confirmed sign-ups with stable keys"
   assert.equal(result.created, 2);
 });
 
-test("the calendar connect scope adds calendar.app.created without dropping existing scopes", async (t) => {
+test("connecting a calendar asks only for the calendar, never for mail or the owner's own events", async (t) => {
   const db = await createStore();
   t.after(() => db.close());
   const config = configWithGoogle();
@@ -331,10 +331,12 @@ test("the calendar connect scope adds calendar.app.created without dropping exis
   const scopes = new URL(url).searchParams.get("scope")?.split(" ") ?? [];
   assert.ok(scopes.includes("https://www.googleapis.com/auth/calendar.app.created"));
   assert.ok(scopes.includes("https://www.googleapis.com/auth/calendar.calendarlist.readonly"));
-  assert.ok(scopes.includes("https://www.googleapis.com/auth/calendar.events.readonly"));
-  assert.ok(scopes.includes("https://www.googleapis.com/auth/gmail.readonly"));
-  // The calendar path must not request mail send.
+  // A person pressing "Connect Google" for a calendar is not handing over their
+  // inbox, and not handing over the events already on their own calendars.
+  assert.equal(scopes.includes("https://www.googleapis.com/auth/gmail.readonly"), false);
   assert.equal(scopes.includes("https://www.googleapis.com/auth/gmail.send"), false);
+  assert.equal(scopes.includes("https://www.googleapis.com/auth/calendar.events.readonly"), false);
+  assert.equal(scopes.includes("https://www.googleapis.com/auth/calendar.events"), false);
 });
 
 test("feed links require an encryption key and ICS mode never calls Google", async (t) => {
